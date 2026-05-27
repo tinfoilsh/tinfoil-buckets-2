@@ -1,11 +1,7 @@
-# Compile (resolves dependencies + builds)
-mvn compile
-
-# Run Main
-mvn exec:java
-
-# Both in one go
+# --- build + run ---
 mvn compile exec:java
 
-# Clean build artifacts
-mvn clean
+# --- other useful ones ---
+mvn compile               # just compile
+mvn dependency:tree       # see all resolved jars
+mvn clean                 # delete target/
