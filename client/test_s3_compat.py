@@ -172,15 +172,15 @@ def test_user_metadata_passthrough(s3, key):
     assert resp["Metadata"]["version"] == "1"
 
 
-@pytest.mark.xfail(reason="Multipart upload not implemented yet", strict=True)
-def test_multipart_upload(s3, key):
+def test_multipart_upload_single_part(s3, key):
+    body = b"x" * (5 * 1024 * 1024 + 7)  # 5 MiB + 7
     mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
     part = s3.upload_part(
         Bucket=BUCKET,
         Key=key,
         UploadId=mp["UploadId"],
         PartNumber=1,
-        Body=b"x" * (5 * 1024 * 1024),
+        Body=body,
     )
     s3.complete_multipart_upload(
         Bucket=BUCKET,
@@ -188,6 +188,71 @@ def test_multipart_upload(s3, key):
         UploadId=mp["UploadId"],
         MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
     )
+    resp = s3.get_object(Bucket=BUCKET, Key=key)
+    assert resp["Body"].read() == body
+
+
+def test_multipart_upload_three_parts(s3, key):
+    p1 = b"A" * (5 * 1024 * 1024)
+    p2 = b"B" * (5 * 1024 * 1024)
+    p3 = b"C" * (1024)  # last can be small
+    mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
+    e1 = s3.upload_part(
+        Bucket=BUCKET, Key=key, UploadId=mp["UploadId"], PartNumber=1, Body=p1
+    )["ETag"]
+    e2 = s3.upload_part(
+        Bucket=BUCKET, Key=key, UploadId=mp["UploadId"], PartNumber=2, Body=p2
+    )["ETag"]
+    e3 = s3.upload_part(
+        Bucket=BUCKET, Key=key, UploadId=mp["UploadId"], PartNumber=3, Body=p3
+    )["ETag"]
+    s3.complete_multipart_upload(
+        Bucket=BUCKET,
+        Key=key,
+        UploadId=mp["UploadId"],
+        MultipartUpload={
+            "Parts": [
+                {"ETag": e1, "PartNumber": 1},
+                {"ETag": e2, "PartNumber": 2},
+                {"ETag": e3, "PartNumber": 3},
+            ]
+        },
+    )
+    resp = s3.get_object(Bucket=BUCKET, Key=key)
+    assert resp["Body"].read() == p1 + p2 + p3
+
+
+def test_multipart_abort(s3, key):
+    mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
+    s3.upload_part(
+        Bucket=BUCKET,
+        Key=key,
+        UploadId=mp["UploadId"],
+        PartNumber=1,
+        Body=b"x" * (5 * 1024 * 1024),
+    )
+    s3.abort_multipart_upload(Bucket=BUCKET, Key=key, UploadId=mp["UploadId"])
+    # Object should not exist after abort
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=BUCKET, Key=key)
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_multipart_out_of_order_rejected(s3, key):
+    mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.upload_part(
+                Bucket=BUCKET,
+                Key=key,
+                UploadId=mp["UploadId"],
+                PartNumber=2,
+                Body=b"x" * (5 * 1024 * 1024),
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidPart"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        s3.abort_multipart_upload(Bucket=BUCKET, Key=key, UploadId=mp["UploadId"])
 
 
 @pytest.mark.xfail(reason="Range requests not implemented yet", strict=True)

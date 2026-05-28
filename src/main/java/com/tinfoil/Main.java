@@ -9,7 +9,7 @@ public class Main {
         S3Client s3 = S3Clients.encrypted(config);
 
         Javalin app = Javalin.create();
-        new S3Routes(s3, config.bucket()).register(app);
+        new S3Routes(s3, config).register(app);
         app.start(config.port());
 
         System.out.println("tinfoil-buckets listening on :" + config.port()
