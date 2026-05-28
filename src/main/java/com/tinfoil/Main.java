@@ -1,12 +1,11 @@
 package com.tinfoil;
 
 import io.javalin.Javalin;
-import software.amazon.awssdk.services.s3.S3Client;
 
 public class Main {
     public static void main(String[] args) {
         Config config = Config.load();
-        S3Client s3 = S3Clients.encrypted(config);
+        var s3 = S3Clients.encrypted(config);
 
         Javalin app = Javalin.create(cfg -> {
             cfg.http.maxRequestSize = S3Routes.MAX_PART_BYTES;

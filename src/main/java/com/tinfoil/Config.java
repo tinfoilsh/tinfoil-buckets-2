@@ -19,7 +19,8 @@ public record Config(
         SecretKey aesKey,
         Region region,
         AwsCredentialsProvider creds,
-        int port) {
+        int port,
+        long maxBufferedGetBytes) {
 
     public static Config load() {
         Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
@@ -28,11 +29,16 @@ public record Config(
                 loadAesKey(require(dotenv, "ENCRYPTION_KEY")),
                 resolveRegion(dotenv),
                 resolveCreds(dotenv),
-                parsePort(dotenv.get("PORT")));
+                parsePort(dotenv.get("PORT")),
+                parseMaxBufferedGetBytes(dotenv.get("MAX_BUFFERED_GET_BYTES")));
     }
 
     private static int parsePort(String s) {
         return (s == null || s.isEmpty()) ? 9000 : Integer.parseInt(s);
+    }
+
+    private static long parseMaxBufferedGetBytes(String s) {
+        return (s == null || s.isEmpty()) ? 1024L * 1024L * 1024L : Long.parseLong(s);
     }
 
     private static SecretKey loadAesKey(String b64) {

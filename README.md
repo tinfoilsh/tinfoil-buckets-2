@@ -49,3 +49,5 @@ PORT=9000
    1. Setting a 1GB per part cap for now, as we have to hold the full thing in the server.
    2. Can have as many active sessions as you want. User beware.
 5. Multi-part state is local to the server, because we need to have the running AES-GCM cipher state so we can continue uploading. If this ever restarts, we lose this session, so there's no point in trying to use the S3 as the SSOT for session state.
+6. GET needs to buffer until the end so we can check the authentication tag. The user can set this with an evnironment var (max 2gb) of buffering. The user is responsible for memory consumption.
+   1. The implementation of this looks like: we turn on delayedAuthentication, and we manually buffer in the server if size < environment var. If it's greater than we stream it to the client, but the client needs to use our special `tinfoil_client` to handle the signal at the end if the data is bad & needs to be thrown away. `enableDelayedAuthenticationMode`

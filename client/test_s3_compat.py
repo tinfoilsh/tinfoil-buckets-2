@@ -384,3 +384,31 @@ def test_range_get(s3, key):
     s3.put_object(Bucket=BUCKET, Key=key, Body=b"0123456789")
     resp = s3.get_object(Bucket=BUCKET, Key=key, Range="bytes=2-5")
     assert resp["Body"].read() == b"2345"
+
+
+# --- Streaming GET + client -------------------------------------------
+
+
+def test_streaming_get_trailer_ok(s3, key):
+    """Happy path: trailer says 'ok' and verified_get returns bytes unchanged."""
+    from tinfoil_client import verified_get
+
+    body = b"streaming-payload-" * 100  # ~1.8 KiB
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+    got = verified_get(s3, Bucket=BUCKET, Key=key)
+    assert got == body
+
+
+def test_streaming_get_iter_chunks(s3, key):
+    """verified_iter yields the full plaintext across chunks."""
+    from tinfoil_client import verified_iter
+
+    body = (b"A" * (256 * 1024)) + (b"B" * (256 * 1024))  # 512 KiB
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+    chunks = list(verified_iter(s3, Bucket=BUCKET, Key=key, chunk_size=64 * 1024))
+    assert b"".join(chunks) == body
+    # Should be more than one chunk for a 512 KiB body at 64 KiB chunks
+    assert len(chunks) > 1
+
+
+# TODO: test when this fails that the client errors correctly.

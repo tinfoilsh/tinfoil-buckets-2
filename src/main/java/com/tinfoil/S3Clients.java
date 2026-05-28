@@ -11,6 +11,7 @@ public final class S3Clients {
                 .aesKey(config.aesKey())
                 .region(config.region())
                 .credentialsProvider(config.creds())
+                .enableDelayedAuthenticationMode(true)
                 .build();
     }
 }

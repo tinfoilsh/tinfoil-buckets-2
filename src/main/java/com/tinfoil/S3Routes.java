@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
@@ -24,6 +25,7 @@ import io.javalin.http.HandlerType;
 import io.javalin.http.HttpStatus;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.core.sync.ResponseTransformer;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
@@ -66,6 +68,7 @@ public class S3Routes {
     private final S3Client s3;
     private final String bucket;
     private final Region region;
+    private final long maxBufferedGetBytes;
     private final ConcurrentHashMap<String, MultipartSession> sessions = new ConcurrentHashMap<>();
     private final ScheduledExecutorService gc = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "tinfoil-mpu-gc");
@@ -77,6 +80,7 @@ public class S3Routes {
         this.s3 = s3;
         this.bucket = config.bucket();
         this.region = config.region();
+        this.maxBufferedGetBytes = config.maxBufferedGetBytes();
     }
 
     public void register(Javalin app) {
@@ -166,13 +170,62 @@ public class S3Routes {
             return;
         }
         String key = ctx.pathParam("key");
-        ResponseBytes<GetObjectResponse> resp = s3.getObjectAsBytes(b -> b
-                .bucket(bucket).key(key));
-        GetObjectResponse meta = resp.response();
-        if (meta.contentType() != null) ctx.contentType(meta.contentType());
-        if (meta.eTag() != null) ctx.header("ETag", meta.eTag());
-        writeUserMetadataHeaders(ctx, meta.metadata());
+
+        // HEAD upstream first to learn the plaintext size and pick a decryption
+        // mode. The HEAD is cheap inside the enclave and lets us route small
+        // objects through the buffered client (auth-verified-before-release,
+        // no trailer dance) and large objects through the streaming client.
+        HeadObjectResponse head = s3.headObject(b -> b.bucket(bucket).key(key));
+        long plaintextSize = Math.max(0, head.contentLength() - GCM_TAG_BYTES);
+
+        if (head.contentType() != null) ctx.contentType(head.contentType());
+        if (head.eTag() != null) ctx.header("ETag", head.eTag());
+        writeUserMetadataHeaders(ctx, head.metadata());
+
+        if (plaintextSize <= maxBufferedGetBytes) {
+            getBuffered(ctx, key);
+        } else {
+            getStreaming(ctx, key);
+        }
+    }
+
+    private void getBuffered(Context ctx, String key) {
+        // getObjectAsBytes drains the full stream before returning. The
+        // encryption client's GCM tag check runs on stream close — if it
+        // fails, the call throws and our handler returns an error. So by
+        // the time we have the byte[], authentication has passed. Trailer
+        // is therefore unconditionally "ok" on this path.
+        ctx.header("Trailer", "X-Tinfoil-Auth");
+        ctx.res().setTrailerFields(() -> Map.of("X-Tinfoil-Auth", "ok"));
+        ResponseBytes<GetObjectResponse> resp = s3.getObjectAsBytes(
+                b -> b.bucket(bucket).key(key));
         ctx.result(resp.asByteArray());
+    }
+
+    private void getStreaming(Context ctx, String key) {
+        // Seed trailer "fail"; flip to "ok" only if the encryption client
+        // returns cleanly (i.e., GCM tag verified at end-of-stream).
+        // On auth failure we swallow the exception so Jetty can complete the
+        // response cleanly with X-Tinfoil-Auth: fail — trailer-blind clients
+        // will see a normal-looking response (they're accepting that risk by
+        // not reading the trailer; use the verified_get/iter helpers to detect
+        // tampering).
+        AtomicReference<String> authResult = new AtomicReference<>("fail");
+        ctx.header("Trailer", "X-Tinfoil-Auth");
+        ctx.res().setTrailerFields(() -> Map.of("X-Tinfoil-Auth", authResult.get()));
+        try {
+            s3.getObject(b -> b.bucket(bucket).key(key),
+                    ResponseTransformer.toOutputStream(ctx.outputStream()));
+            authResult.set("ok");
+        } catch (S3EncryptionClientException e) {
+            if (e.getCause() instanceof S3Exception) {
+                // Upstream error (NoSuchKey etc.) — those throw before bytes
+                // start flowing, so the normal exception path handles them.
+                throw e;
+            }
+            // Auth tag mismatch mid-stream. Leave authResult = "fail" and let
+            // Jetty finish the response with the trailer.
+        }
     }
 
     private void handleHead(Context ctx) {
