@@ -31,7 +31,7 @@ public record Config(
                 resolveRegion(dotenv),
                 resolveCreds(dotenv),
                 parsePort(dotenv.get("PORT")),
-                parseBool(dotenv.get("DELAYED_AUTH"), false),
+                parseBool(dotenv.get("DANGEROUS_DELAYED_AUTH"), false),
                 parseBufferSize(dotenv.get("BUFFER_SIZE")));
     }
 
@@ -51,7 +51,7 @@ public record Config(
         // Size against -Xmx (which is itself a subset of enclave memory).
         // The encryption client supports up to 64 GiB.
         //
-        // For larger objects, set DELAYED_AUTH=true. 
+        // For larger objects, set DANGEROUS_DELAYED_AUTH=true.
         return (s == null || s.isEmpty()) ? 1024L * 1024L * 1024L : Long.parseLong(s);
     }
 

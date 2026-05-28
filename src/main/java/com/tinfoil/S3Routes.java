@@ -103,7 +103,7 @@ public class S3Routes {
                 writeS3Error(ctx, 413, "EntityTooLarge",
                         "Object exceeds the sidecar's BUFFER_SIZE. "
                         + "Raise BUFFER_SIZE (up to 64 GiB), or set "
-                        + "DELAYED_AUTH=true to stream (supports arbitrarily large objects.)");
+                        + "DANGEROUS_DELAYED_AUTH=true to stream (supports arbitrarily large objects.)");
             } else {
                 writeS3Error(ctx, 500, "InternalError", e.getMessage());
             }
