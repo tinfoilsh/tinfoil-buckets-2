@@ -189,15 +189,12 @@ def test_list_objects_v2_pagination(s3):
             s3.delete_object(Bucket=BUCKET, Key=k)
 
 
-@pytest.mark.xfail(reason="HeadBucket not implemented yet", strict=True)
 def test_head_bucket(s3):
-    s3.head_bucket(Bucket=BUCKET)
+    resp = s3.head_bucket(Bucket=BUCKET)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
-@pytest.mark.xfail(
-    reason="x-amz-meta-* user metadata passthrough not implemented", strict=True
-)
-def test_user_metadata_passthrough(s3, key):
+def test_user_metadata_passthrough_head(s3, key):
     s3.put_object(
         Bucket=BUCKET,
         Key=key,
@@ -207,6 +204,42 @@ def test_user_metadata_passthrough(s3, key):
     resp = s3.head_object(Bucket=BUCKET, Key=key)
     assert resp["Metadata"]["author"] == "tinfoil"
     assert resp["Metadata"]["version"] == "1"
+
+
+def test_user_metadata_passthrough_get(s3, key):
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=b"x",
+        Metadata={"author": "tinfoil", "purpose": "testing"},
+    )
+    resp = s3.get_object(Bucket=BUCKET, Key=key)
+    assert resp["Metadata"]["author"] == "tinfoil"
+    assert resp["Metadata"]["purpose"] == "testing"
+
+
+def test_user_metadata_passthrough_multipart(s3, key):
+    body = b"y" * (5 * 1024 * 1024 + 3)
+    mp = s3.create_multipart_upload(
+        Bucket=BUCKET,
+        Key=key,
+        Metadata={"source": "multipart"},
+    )
+    part = s3.upload_part(
+        Bucket=BUCKET,
+        Key=key,
+        UploadId=mp["UploadId"],
+        PartNumber=1,
+        Body=body,
+    )
+    s3.complete_multipart_upload(
+        Bucket=BUCKET,
+        Key=key,
+        UploadId=mp["UploadId"],
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
+    )
+    resp = s3.head_object(Bucket=BUCKET, Key=key)
+    assert resp["Metadata"]["source"] == "multipart"
 
 
 def test_multipart_upload_single_part(s3, key):

@@ -2,6 +2,8 @@ package com.tinfoil;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import io.javalin.Javalin;
@@ -52,6 +54,8 @@ public class S3Routes {
         app.post("/{bucket}/<key>", this::handlePost);
         app.get("/{bucket}", this::handleBucketGet);
         app.get("/{bucket}/", this::handleBucketGet);
+        app.head("/{bucket}", this::handleBucketHead);
+        app.head("/{bucket}/", this::handleBucketHead);
 
         app.exception(S3Exception.class, S3Routes::handleS3Exception);
         app.exception(S3EncryptionClientException.class, (e, ctx) -> {
@@ -101,6 +105,8 @@ public class S3Routes {
         PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(key);
         String contentType = ctx.header("Content-Type");
         if (contentType != null) b.contentType(contentType);
+        Map<String, String> userMeta = extractUserMetadata(ctx);
+        if (!userMeta.isEmpty()) b.metadata(userMeta);
         PutObjectResponse resp = s3.putObject(b.build(), RequestBody.fromBytes(body));
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
         ctx.status(HttpStatus.OK);
@@ -113,6 +119,7 @@ public class S3Routes {
         GetObjectResponse meta = resp.response();
         if (meta.contentType() != null) ctx.contentType(meta.contentType());
         if (meta.eTag() != null) ctx.header("ETag", meta.eTag());
+        writeUserMetadataHeaders(ctx, meta.metadata());
         ctx.result(resp.asByteArray());
     }
 
@@ -125,6 +132,7 @@ public class S3Routes {
         ctx.header("Content-Length", String.valueOf(len));
         if (resp.contentType() != null) ctx.contentType(resp.contentType());
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
+        writeUserMetadataHeaders(ctx, resp.metadata());
         ctx.status(HttpStatus.OK);
     }
 
@@ -134,6 +142,11 @@ public class S3Routes {
     }
 
     // --- Bucket-level operations ---------------------------------------------
+
+    private void handleBucketHead(Context ctx) {
+        s3.headBucket(b -> b.bucket(bucket));
+        ctx.status(HttpStatus.OK);
+    }
 
     private void handleBucketGet(Context ctx) {
         String listType = ctx.queryParam("list-type");
@@ -218,6 +231,8 @@ public class S3Routes {
                 .bucket(bucket).key(key);
         String contentType = ctx.header("Content-Type");
         if (contentType != null) b.contentType(contentType);
+        Map<String, String> userMeta = extractUserMetadata(ctx);
+        if (!userMeta.isEmpty()) b.metadata(userMeta);
         CreateMultipartUploadResponse resp = s3.createMultipartUpload(b.build());
         String uploadId = resp.uploadId();
         sessions.put(uploadId, new MultipartSession(uploadId, key));
@@ -371,6 +386,28 @@ public class S3Routes {
 
     private static String xmlEscape(String s) {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    private static Map<String, String> extractUserMetadata(Context ctx) {
+        Map<String, String> meta = new HashMap<>();
+        for (Map.Entry<String, String> h : ctx.headerMap().entrySet()) {
+            String name = h.getKey().toLowerCase();
+            if (name.startsWith("x-amz-meta-")) {
+                meta.put(name.substring("x-amz-meta-".length()), h.getValue());
+            }
+        }
+        return meta;
+    }
+
+    private static void writeUserMetadataHeaders(Context ctx, Map<String, String> metadata) {
+        if (metadata == null) return;
+        for (Map.Entry<String, String> e : metadata.entrySet()) {
+            // The encryption client stores its own metadata under x-amz-* keys
+            // (e.g. x-amz-d, x-amz-i, x-amz-w). User metadata uses any other name.
+            if (!e.getKey().toLowerCase().startsWith("x-amz-")) {
+                ctx.header("x-amz-meta-" + e.getKey(), e.getValue());
+            }
+        }
     }
 
     private static String md5Hex(byte[] data) {
