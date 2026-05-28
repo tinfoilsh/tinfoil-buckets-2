@@ -29,7 +29,6 @@ import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
 import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
@@ -140,13 +139,22 @@ public class S3Routes {
 
     private void putObject(Context ctx) {
         String key = ctx.pathParam("key");
-        byte[] body = ctx.bodyAsBytes();
+        String lenHeader = ctx.header("Content-Length");
+        if (lenHeader == null) {
+            writeS3Error(ctx, 411, "MissingContentLength",
+                    "Content-Length header is required for PutObject.");
+            return;
+        }
+        long contentLength = Long.parseLong(lenHeader);
+
         PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(key);
         String contentType = ctx.header("Content-Type");
         if (contentType != null) b.contentType(contentType);
         Map<String, String> userMeta = extractUserMetadata(ctx);
         if (!userMeta.isEmpty()) b.metadata(userMeta);
-        PutObjectResponse resp = s3.putObject(b.build(), RequestBody.fromBytes(body));
+
+        PutObjectResponse resp = s3.putObject(b.build(),
+                RequestBody.fromInputStream(ctx.bodyInputStream(), contentLength));
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
         ctx.status(HttpStatus.OK);
     }
@@ -303,6 +311,27 @@ public class S3Routes {
         String key = ctx.pathParam("key");
         ListPartsResponse resp = s3.listParts(ListPartsRequest.builder()
                 .bucket(bucket).key(key).uploadId(uploadId).build());
+
+        // Snapshot our locally-buffered "pending" part, if any, so we can surface
+        // it in the listing. Upstream doesn't see it yet — we hold the most-recent
+        // part until we know whether it's the last (see multipart design notes).
+        Integer pendingNum = null;
+        Integer pendingSize = null;
+        String pendingEtag = null;
+        MultipartSession session = sessions.get(uploadId);
+        if (session != null) {
+            session.lock.lock();
+            try {
+                if (session.pendingPartBytes != null) {
+                    pendingNum = session.pendingPartNumber;
+                    pendingSize = session.pendingPartBytes.length;
+                    pendingEtag = session.pendingPartEtag;
+                }
+            } finally {
+                session.lock.unlock();
+            }
+        }
+
         String bucketParam = ctx.pathParam("bucket");
         StringBuilder xml = new StringBuilder(512);
         xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult>");
@@ -310,7 +339,9 @@ public class S3Routes {
         xml.append("<Key>").append(xmlEscape(key)).append("</Key>");
         xml.append("<UploadId>").append(xmlEscape(uploadId)).append("</UploadId>");
         xml.append("<PartNumberMarker>0</PartNumberMarker>");
-        xml.append("<NextPartNumberMarker>").append(resp.nextPartNumberMarker() != null ? resp.nextPartNumberMarker() : 0).append("</NextPartNumberMarker>");
+        int nextMarker = resp.nextPartNumberMarker() != null ? resp.nextPartNumberMarker() : 0;
+        if (pendingNum != null && pendingNum > nextMarker) nextMarker = pendingNum;
+        xml.append("<NextPartNumberMarker>").append(nextMarker).append("</NextPartNumberMarker>");
         xml.append("<MaxParts>").append(resp.maxParts() != null ? resp.maxParts() : 1000).append("</MaxParts>");
         xml.append("<IsTruncated>").append(Boolean.TRUE.equals(resp.isTruncated())).append("</IsTruncated>");
         xml.append("<StorageClass>STANDARD</StorageClass>");
@@ -328,6 +359,15 @@ public class S3Routes {
                 xml.append("<Size>").append(size).append("</Size>");
                 xml.append("</Part>");
             }
+        }
+        if (pendingNum != null) {
+            xml.append("<Part>");
+            xml.append("<PartNumber>").append(pendingNum).append("</PartNumber>");
+            if (pendingEtag != null) {
+                xml.append("<ETag>").append(xmlEscape(pendingEtag)).append("</ETag>");
+            }
+            xml.append("<Size>").append(pendingSize).append("</Size>");
+            xml.append("</Part>");
         }
         xml.append("</ListPartsResult>");
         ctx.contentType("application/xml");
@@ -474,14 +514,16 @@ public class S3Routes {
                 session.completedParts.add(cp);
             }
 
+            String etag = "\"" + md5Hex(body) + "\"";
             session.pendingPartNumber = partNumber;
             session.pendingPartBytes = body;
+            session.pendingPartEtag = etag;
             session.nextExpectedPartNumber = partNumber + 1;
+            ctx.header("ETag", etag);
         } finally {
             session.lock.unlock();
         }
 
-        ctx.header("ETag", "\"" + md5Hex(body) + "\"");
         ctx.status(HttpStatus.OK);
     }
 
@@ -549,6 +591,7 @@ public class S3Routes {
                 .build();
         session.pendingPartBytes = null;
         session.pendingPartNumber = -1;
+        session.pendingPartEtag = null;
         return cp;
     }
 

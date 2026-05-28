@@ -254,9 +254,7 @@ def test_list_multipart_uploads(s3):
 def test_list_parts(s3, key):
     mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
     try:
-        # Upload two parts; only part 1 is flushed upstream (part 2 stays buffered
-        # until next part or Complete arrives). ListParts shows what's upstream.
-        for n in (1, 2):
+        for n in (1, 2, 3):
             s3.upload_part(
                 Bucket=BUCKET,
                 Key=key,
@@ -266,7 +264,10 @@ def test_list_parts(s3, key):
             )
         resp = s3.list_parts(Bucket=BUCKET, Key=key, UploadId=mp["UploadId"])
         assert resp["UploadId"] == mp["UploadId"]
-        assert any(p["PartNumber"] == 1 for p in resp.get("Parts", []))
+        # All three should be visible: parts 1 and 2 flushed upstream, part 3
+        # is locally buffered but surfaced so clients see N parts, not N-1.
+        part_numbers = sorted(p["PartNumber"] for p in resp["Parts"])
+        assert part_numbers == [1, 2, 3]
     finally:
         s3.abort_multipart_upload(Bucket=BUCKET, Key=key, UploadId=mp["UploadId"])
 

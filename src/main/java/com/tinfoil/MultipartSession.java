@@ -16,6 +16,7 @@ public class MultipartSession {
     public int nextExpectedPartNumber = 1;
     public int pendingPartNumber = -1;
     public byte[] pendingPartBytes = null;
+    public String pendingPartEtag = null;
     public final List<CompletedPart> completedParts = new ArrayList<>();
 
     public MultipartSession(String uploadId, String key) {
