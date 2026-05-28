@@ -82,6 +82,10 @@ public class S3Routes {
         this.delayedAuth = config.delayedAuth();
     }
 
+    public void shutdown() {
+        gc.shutdownNow();
+    }
+
     public void register(Javalin app) {
         app.put("/{bucket}/<key>", this::handlePut);
         app.get("/{bucket}/<key>", this::handleGet);
@@ -154,7 +158,14 @@ public class S3Routes {
                     "Content-Length header is required for PutObject.");
             return;
         }
-        long contentLength = Long.parseLong(lenHeader);
+        long contentLength;
+        try {
+            contentLength = Long.parseLong(lenHeader);
+        } catch (NumberFormatException e) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "Content-Length must be a valid integer, got: " + lenHeader);
+            return;
+        }
 
         PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(key);
         String contentType = ctx.header("Content-Type");
@@ -305,7 +316,11 @@ public class S3Routes {
 
     private static List<ObjectIdentifier> parseDeleteRequestKeys(byte[] body) {
         try {
-            DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            // Reject DOCTYPE declarations to prevent XXE (external entity expansion,
+            // SSRF via SYSTEM URIs, billion-laughs DoS).
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            DocumentBuilder builder = factory.newDocumentBuilder();
             Document doc = builder.parse(new ByteArrayInputStream(body));
             NodeList keyNodes = doc.getElementsByTagName("Key");
             List<ObjectIdentifier> keys = new ArrayList<>(keyNodes.getLength());
@@ -527,7 +542,20 @@ public class S3Routes {
             writeS3Error(ctx, 404, "NoSuchUpload", "The specified upload does not exist.");
             return;
         }
-        int partNumber = Integer.parseInt(ctx.queryParam("partNumber"));
+        String partNumberParam = ctx.queryParam("partNumber");
+        if (partNumberParam == null) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "partNumber query parameter is required for uploadPart.");
+            return;
+        }
+        int partNumber;
+        try {
+            partNumber = Integer.parseInt(partNumberParam);
+        } catch (NumberFormatException e) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "partNumber must be a valid integer, got: " + partNumberParam);
+            return;
+        }
         long claimedLength = ctx.contentLength();
         if (claimedLength > MAX_PART_BYTES) {
             writeS3Error(ctx, 400, "EntityTooLarge",
@@ -610,9 +638,14 @@ public class S3Routes {
             writeS3Error(ctx, 404, "NoSuchUpload", "The specified upload does not exist.");
             return;
         }
-        s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
-                .bucket(bucket).key(session.key).uploadId(uploadId).build());
-        sessions.remove(uploadId);
+        session.lock.lock();
+        try {
+            s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                    .bucket(bucket).key(session.key).uploadId(uploadId).build());
+            sessions.remove(uploadId);
+        } finally {
+            session.lock.unlock();
+        }
         ctx.status(HttpStatus.NO_CONTENT);
     }
 

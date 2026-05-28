@@ -10,7 +10,8 @@ public class Main {
         Javalin app = Javalin.create(cfg -> {
             cfg.http.maxRequestSize = S3Routes.MAX_PART_BYTES;
         });
-        new S3Routes(s3, config).register(app);
+        S3Routes routes = new S3Routes(s3, config);
+        routes.register(app);
         app.start(config.port());
 
         System.out.println("tinfoil-buckets listening on :" + config.port()
@@ -18,6 +19,7 @@ public class Main {
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             app.stop();
+            routes.shutdown();
             s3.close();
         }));
     }

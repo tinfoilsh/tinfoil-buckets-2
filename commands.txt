@@ -1,7 +1,0 @@
-# --- build + run ---
-mvn compile exec:java
-
-# --- other useful ones ---
-mvn compile               # just compile
-mvn dependency:tree       # see all resolved jars
-mvn clean                 # delete target/

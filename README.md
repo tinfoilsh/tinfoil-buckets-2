@@ -13,6 +13,7 @@ Ideally we can just point the URl & not mess around with the any s3 sdk, so that
 - **Path-style only.** Configure your S3 SDK with `forcePathStyle: true` (or equivalent). Virtual-hosted (`bucket.s3.amazonaws.com`) URLs are not supported.
 - **Single backing bucket for now.** All requests route to the bucket configured on the sidecar server via `BUCKET`; the bucket name in the request URL is currently ignored. (Future: per-request bucket selection.)
 - **No auth.** sigv4 signatures from clients are accepted and discarded.
+- When GET-ing large files, users need to use a special client. Otherwise, any S3 sdk should work.
 
 ## Configure
 
@@ -34,7 +35,6 @@ PORT=9000
 
 ## Test
 
-`./test.sh` runs PUT / HEAD / GET / DELETE against a running server and checks the round-trip.
 `client/` contains the python S3 sdk and the pytest suite.
 
 Default suite (sidecar in default buffered mode, any `BUFFER_SIZE`):
