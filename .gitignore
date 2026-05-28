@@ -2,3 +2,7 @@ target/
 .idea/
 *.iml
 .vscode/
+.env
+
+client/.venv/
+__pycache__/
