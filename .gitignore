@@ -5,3 +5,4 @@ target/
 .env
 
 client/.venv/
+__pycache__/

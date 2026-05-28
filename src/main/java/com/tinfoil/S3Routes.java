@@ -15,6 +15,8 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.encryption.s3.S3EncryptionClientException;
 
 public class S3Routes {
+    private static final int GCM_TAG_BYTES = 16;
+
     private final S3Client s3;
     private final String bucket;
 
@@ -64,10 +66,8 @@ public class S3Routes {
         String key = ctx.pathParam("key");
         HeadObjectResponse resp = s3.headObject(b -> b
                 .bucket(bucket).key(key));
-        String plainLen = resp.metadata() != null
-                ? resp.metadata().get("x-amz-unencrypted-content-length")
-                : null;
-        long len = plainLen != null ? Long.parseLong(plainLen) : resp.contentLength();
+        // AES-GCM (v4 default) appends a 16-byte authentication tag to the ciphertext.
+        long len = Math.max(0, resp.contentLength() - GCM_TAG_BYTES);
         ctx.header("Content-Length", String.valueOf(len));
         if (resp.contentType() != null) ctx.contentType(resp.contentType());
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
