@@ -48,4 +48,4 @@ PORT=9000
 4. Multi-part constraints
    1. Setting a 1GB per part cap for now, as we have to hold the full thing in the server.
    2. Can have as many active sessions as you want. User beware.
-   3.
+5. Multi-part state is local to the server, because we need to have the running AES-GCM cipher state so we can continue uploading. If this ever restarts, we lose this session, so there's no point in trying to use the S3 as the SSOT for session state.
