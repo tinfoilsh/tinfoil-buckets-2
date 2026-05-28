@@ -411,4 +411,67 @@ def test_streaming_get_iter_chunks(s3, key):
     assert len(chunks) > 1
 
 
-# TODO: test when this fails that the client errors correctly.
+# --- Mode-specific tests (opt-in via env vars) -------------------------------
+# These tests verify behavior that depends on how the sidecar was started.
+# Both are skipped by default. To run them, restart the sidecar in the matching
+# mode and set the corresponding test-side env var (see usage below).
+
+SIDECAR_BUFFER_SIZE = os.environ.get("SIDECAR_BUFFER_SIZE")
+SIDECAR_DELAYED_AUTH = os.environ.get("SIDECAR_DELAYED_AUTH", "").lower() == "true"
+
+
+@pytest.mark.skipif(
+    SIDECAR_BUFFER_SIZE is None,
+    reason=(
+        "Set SIDECAR_BUFFER_SIZE=<bytes> (matching the sidecar's BUFFER_SIZE) to run. "
+        "Sidecar must be started in default (buffered) mode with that BUFFER_SIZE."
+    ),
+)
+def test_buffer_exceeded_returns_413(s3, key):
+    """PUT an object 1 MiB larger than the sidecar's buffer cap, expect 413 EntityTooLarge on GET."""
+    assert (
+        SIDECAR_BUFFER_SIZE is not None
+    )  # skipif-guaranteed; here for the type checker
+    cap = int(SIDECAR_BUFFER_SIZE)
+    body = b"x" * (cap + 1024 * 1024)
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=BUCKET, Key=key)
+    err = exc.value.response
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 413
+    assert err["Error"]["Code"] == "EntityTooLarge"
+    msg = err["Error"]["Message"]
+    assert "BUFFER_SIZE" in msg
+    assert "DANGEROUS_DELAYED_AUTH" in msg
+
+
+@pytest.mark.skipif(
+    not SIDECAR_DELAYED_AUTH,
+    reason=(
+        "Set SIDECAR_DELAYED_AUTH=true to run. Sidecar must be started with "
+        "DANGEROUS_DELAYED_AUTH=true."
+    ),
+)
+def test_delayed_auth_streams_with_ok_trailer(s3, key):
+    """In delayed-auth mode, verified_get must successfully read the 'ok' trailer."""
+    from tinfoil_client import verified_get
+
+    body = b"delayed-auth-payload" * 50_000  # ~1 MiB
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+    assert verified_get(s3, Bucket=BUCKET, Key=key) == body
+
+
+@pytest.mark.skipif(
+    not SIDECAR_DELAYED_AUTH,
+    reason="Set SIDECAR_DELAYED_AUTH=true (with sidecar in DANGEROUS_DELAYED_AUTH=true).",
+)
+def test_delayed_auth_handles_objects_above_default_buffer(s3, key):
+    """Delayed-auth mode must handle objects bigger than the default 64 MiB buffered cap."""
+    from tinfoil_client import verified_iter
+
+    body = b"X" * (80 * 1024 * 1024)  # 80 MiB — would fail in default buffered mode
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+    total = 0
+    for chunk in verified_iter(s3, Bucket=BUCKET, Key=key, chunk_size=4 * 1024 * 1024):
+        total += len(chunk)
+    assert total == len(body)

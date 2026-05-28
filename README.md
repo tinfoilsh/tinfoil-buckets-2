@@ -35,7 +35,41 @@ PORT=9000
 ## Test
 
 `./test.sh` runs PUT / HEAD / GET / DELETE against a running server and checks the round-trip.
-`client/` contains the python S3 sdk
+`client/` contains the python S3 sdk and the pytest suite.
+
+Default suite (sidecar in default buffered mode, any `BUFFER_SIZE`):
+
+```
+client/.venv/bin/pytest -v client/test_s3_compat.py
+```
+
+### Mode-specific tests (opt-in)
+
+Some tests are gated on env vars so they only run when the sidecar is in the matching mode.
+
+**Buffer-exceeded path** — verify the `413 EntityTooLarge` response when an object is bigger than `BUFFER_SIZE`. Start the sidecar with a small buffer (here, 10 MiB):
+
+```
+BUFFER_SIZE=10485760 mvn compile exec:java
+```
+
+In another shell, tell the test what cap the sidecar is using:
+
+```
+SIDECAR_BUFFER_SIZE=10485760 client/.venv/bin/pytest -v client/test_s3_compat.py::test_buffer_exceeded_returns_413
+```
+
+**Delayed-auth mode** — verify streaming + trailer behavior. Start the sidecar with delayed auth on:
+
+```
+DANGEROUS_DELAYED_AUTH=true mvn compile exec:java
+```
+
+In another shell:
+
+```
+SIDECAR_DELAYED_AUTH=true client/.venv/bin/pytest -v client/test_s3_compat.py -k delayed_auth
+```
 
 ## Design Decisions (constraints)
 
