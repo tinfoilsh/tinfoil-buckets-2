@@ -20,7 +20,8 @@ public record Config(
         Region region,
         AwsCredentialsProvider creds,
         int port,
-        long maxBufferedGetBytes) {
+        boolean delayedAuth,
+        long bufferSize) {
 
     public static Config load() {
         Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
@@ -30,14 +31,27 @@ public record Config(
                 resolveRegion(dotenv),
                 resolveCreds(dotenv),
                 parsePort(dotenv.get("PORT")),
-                parseMaxBufferedGetBytes(dotenv.get("MAX_BUFFERED_GET_BYTES")));
+                parseBool(dotenv.get("DELAYED_AUTH"), false),
+                parseBufferSize(dotenv.get("BUFFER_SIZE")));
     }
 
     private static int parsePort(String s) {
         return (s == null || s.isEmpty()) ? 9000 : Integer.parseInt(s);
     }
 
-    private static long parseMaxBufferedGetBytes(String s) {
+    private static boolean parseBool(String s, boolean defaultValue) {
+        if (s == null || s.isEmpty()) return defaultValue;
+        return Boolean.parseBoolean(s);
+    }
+
+    private static long parseBufferSize(String s) {
+        // Default 1 GiB. Used only when DELAYED_AUTH=false. The encryption
+        // client buffers the full plaintext in JVM heap before responding,
+        // verifying the GCM auth tag before any byte leaves the sidecar.
+        // Size against -Xmx (which is itself a subset of enclave memory).
+        // The encryption client supports up to 64 GiB.
+        //
+        // For larger objects, set DELAYED_AUTH=true. 
         return (s == null || s.isEmpty()) ? 1024L * 1024L * 1024L : Long.parseLong(s);
     }
 
