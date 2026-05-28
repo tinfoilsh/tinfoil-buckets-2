@@ -1,10 +1,22 @@
 package com.tinfoil;
 
+import java.io.ByteArrayInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.NodeList;
 
 import io.javalin.Javalin;
 import io.javalin.http.Context;
@@ -16,16 +28,29 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.DeletedObject;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListMultipartUploadsRequest;
+import software.amazon.awssdk.services.s3.model.ListMultipartUploadsResponse;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.ListPartsRequest;
+import software.amazon.awssdk.services.s3.model.ListPartsResponse;
+import software.amazon.awssdk.services.s3.model.MultipartUpload;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
+import software.amazon.awssdk.services.s3.model.Part;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+import software.amazon.awssdk.services.s3.model.S3Error;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.model.SdkPartType;
@@ -36,14 +61,23 @@ import software.amazon.encryption.s3.S3EncryptionClientException;
 public class S3Routes {
     private static final int GCM_TAG_BYTES = 16;
     public static final long MAX_PART_BYTES = 1024L * 1024L * 1024L;
+    private static final long MULTIPART_SESSION_TTL_SECONDS = 3600;
+    private static final long MULTIPART_GC_PERIOD_SECONDS = 300;
 
     private final S3Client s3;
     private final String bucket;
+    private final Region region;
     private final ConcurrentHashMap<String, MultipartSession> sessions = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService gc = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "tinfoil-mpu-gc");
+        t.setDaemon(true);
+        return t;
+    });
 
     public S3Routes(S3Client s3, Config config) {
         this.s3 = s3;
         this.bucket = config.bucket();
+        this.region = config.region();
     }
 
     public void register(Javalin app) {
@@ -54,8 +88,13 @@ public class S3Routes {
         app.post("/{bucket}/<key>", this::handlePost);
         app.get("/{bucket}", this::handleBucketGet);
         app.get("/{bucket}/", this::handleBucketGet);
+        app.post("/{bucket}", this::handleBucketPost);
+        app.post("/{bucket}/", this::handleBucketPost);
         app.head("/{bucket}", this::handleBucketHead);
         app.head("/{bucket}/", this::handleBucketHead);
+
+        gc.scheduleAtFixedRate(this::sweepSessions,
+                MULTIPART_GC_PERIOD_SECONDS, MULTIPART_GC_PERIOD_SECONDS, TimeUnit.SECONDS);
 
         app.exception(S3Exception.class, S3Routes::handleS3Exception);
         app.exception(S3EncryptionClientException.class, (e, ctx) -> {
@@ -113,6 +152,11 @@ public class S3Routes {
     }
 
     private void handleGet(Context ctx) {
+        String uploadId = ctx.queryParam("uploadId");
+        if (uploadId != null) {
+            listParts(ctx, uploadId);
+            return;
+        }
         String key = ctx.pathParam("key");
         ResponseBytes<GetObjectResponse> resp = s3.getObjectAsBytes(b -> b
                 .bucket(bucket).key(key));
@@ -149,13 +193,162 @@ public class S3Routes {
     }
 
     private void handleBucketGet(Context ctx) {
-        String listType = ctx.queryParam("list-type");
-        if (!"2".equals(listType)) {
+        if ("2".equals(ctx.queryParam("list-type"))) {
+            listObjectsV2(ctx);
+        } else if (ctx.queryParamMap().containsKey("uploads")) {
+            listMultipartUploads(ctx);
+        } else if (ctx.queryParamMap().containsKey("location")) {
+            getBucketLocation(ctx);
+        } else {
             writeS3Error(ctx, 400, "InvalidRequest",
-                    "Only ListObjectsV2 (list-type=2) is supported.");
+                    "Unsupported bucket GET operation.");
+        }
+    }
+
+    private void handleBucketPost(Context ctx) {
+        if (ctx.queryParamMap().containsKey("delete")) {
+            deleteObjects(ctx);
+        } else {
+            writeS3Error(ctx, 400, "InvalidRequest",
+                    "Unsupported bucket POST operation.");
+        }
+    }
+
+    private void getBucketLocation(Context ctx) {
+        ctx.contentType("application/xml");
+        ctx.result("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                + "<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                + xmlEscape(region.id())
+                + "</LocationConstraint>");
+    }
+
+    private void deleteObjects(Context ctx) {
+        List<ObjectIdentifier> toDelete = parseDeleteRequestKeys(ctx.bodyAsBytes());
+        if (toDelete.isEmpty()) {
+            writeS3Error(ctx, 400, "MalformedXML", "Delete request contained no keys.");
             return;
         }
-        listObjectsV2(ctx);
+        DeleteObjectsResponse resp = s3.deleteObjects(DeleteObjectsRequest.builder()
+                .bucket(bucket)
+                .delete(d -> d.objects(toDelete))
+                .build());
+
+        StringBuilder xml = new StringBuilder(256);
+        xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>");
+        if (resp.deleted() != null) {
+            for (DeletedObject d : resp.deleted()) {
+                xml.append("<Deleted><Key>").append(xmlEscape(d.key())).append("</Key></Deleted>");
+            }
+        }
+        if (resp.errors() != null) {
+            for (S3Error e : resp.errors()) {
+                xml.append("<Error>");
+                xml.append("<Key>").append(xmlEscape(e.key())).append("</Key>");
+                if (e.code() != null) xml.append("<Code>").append(xmlEscape(e.code())).append("</Code>");
+                if (e.message() != null) xml.append("<Message>").append(xmlEscape(e.message())).append("</Message>");
+                xml.append("</Error>");
+            }
+        }
+        xml.append("</DeleteResult>");
+        ctx.contentType("application/xml");
+        ctx.result(xml.toString());
+    }
+
+    private static List<ObjectIdentifier> parseDeleteRequestKeys(byte[] body) {
+        try {
+            DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+            Document doc = builder.parse(new ByteArrayInputStream(body));
+            NodeList keyNodes = doc.getElementsByTagName("Key");
+            List<ObjectIdentifier> keys = new ArrayList<>(keyNodes.getLength());
+            for (int i = 0; i < keyNodes.getLength(); i++) {
+                keys.add(ObjectIdentifier.builder().key(keyNodes.item(i).getTextContent()).build());
+            }
+            return keys;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse DeleteObjects request: " + e.getMessage(), e);
+        }
+    }
+
+    private void listMultipartUploads(Context ctx) {
+        ListMultipartUploadsResponse resp = s3.listMultipartUploads(
+                ListMultipartUploadsRequest.builder().bucket(bucket).build());
+        String bucketParam = ctx.pathParam("bucket");
+        StringBuilder xml = new StringBuilder(512);
+        xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListMultipartUploadsResult>");
+        xml.append("<Bucket>").append(xmlEscape(bucketParam)).append("</Bucket>");
+        xml.append("<KeyMarker></KeyMarker>");
+        xml.append("<UploadIdMarker></UploadIdMarker>");
+        xml.append("<NextKeyMarker></NextKeyMarker>");
+        xml.append("<NextUploadIdMarker></NextUploadIdMarker>");
+        xml.append("<MaxUploads>").append(resp.maxUploads() != null ? resp.maxUploads() : 1000).append("</MaxUploads>");
+        xml.append("<IsTruncated>").append(Boolean.TRUE.equals(resp.isTruncated())).append("</IsTruncated>");
+        if (resp.uploads() != null) {
+            for (MultipartUpload u : resp.uploads()) {
+                xml.append("<Upload>");
+                xml.append("<Key>").append(xmlEscape(u.key())).append("</Key>");
+                xml.append("<UploadId>").append(xmlEscape(u.uploadId())).append("</UploadId>");
+                if (u.initiated() != null) {
+                    xml.append("<Initiated>").append(u.initiated().toString()).append("</Initiated>");
+                }
+                xml.append("<StorageClass>STANDARD</StorageClass>");
+                xml.append("</Upload>");
+            }
+        }
+        xml.append("</ListMultipartUploadsResult>");
+        ctx.contentType("application/xml");
+        ctx.result(xml.toString());
+    }
+
+    private void listParts(Context ctx, String uploadId) {
+        String key = ctx.pathParam("key");
+        ListPartsResponse resp = s3.listParts(ListPartsRequest.builder()
+                .bucket(bucket).key(key).uploadId(uploadId).build());
+        String bucketParam = ctx.pathParam("bucket");
+        StringBuilder xml = new StringBuilder(512);
+        xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult>");
+        xml.append("<Bucket>").append(xmlEscape(bucketParam)).append("</Bucket>");
+        xml.append("<Key>").append(xmlEscape(key)).append("</Key>");
+        xml.append("<UploadId>").append(xmlEscape(uploadId)).append("</UploadId>");
+        xml.append("<PartNumberMarker>0</PartNumberMarker>");
+        xml.append("<NextPartNumberMarker>").append(resp.nextPartNumberMarker() != null ? resp.nextPartNumberMarker() : 0).append("</NextPartNumberMarker>");
+        xml.append("<MaxParts>").append(resp.maxParts() != null ? resp.maxParts() : 1000).append("</MaxParts>");
+        xml.append("<IsTruncated>").append(Boolean.TRUE.equals(resp.isTruncated())).append("</IsTruncated>");
+        xml.append("<StorageClass>STANDARD</StorageClass>");
+        if (resp.parts() != null) {
+            for (Part p : resp.parts()) {
+                xml.append("<Part>");
+                xml.append("<PartNumber>").append(p.partNumber()).append("</PartNumber>");
+                if (p.lastModified() != null) {
+                    xml.append("<LastModified>").append(p.lastModified().toString()).append("</LastModified>");
+                }
+                if (p.eTag() != null) {
+                    xml.append("<ETag>").append(xmlEscape(p.eTag())).append("</ETag>");
+                }
+                long size = p.size() != null ? Math.max(0, p.size() - GCM_TAG_BYTES) : 0;
+                xml.append("<Size>").append(size).append("</Size>");
+                xml.append("</Part>");
+            }
+        }
+        xml.append("</ListPartsResult>");
+        ctx.contentType("application/xml");
+        ctx.result(xml.toString());
+    }
+
+    private void sweepSessions() {
+        Instant cutoff = Instant.now().minusSeconds(MULTIPART_SESSION_TTL_SECONDS);
+        List<MultipartSession> expired = new ArrayList<>();
+        for (MultipartSession s : sessions.values()) {
+            if (s.createdAt.isBefore(cutoff)) expired.add(s);
+        }
+        for (MultipartSession s : expired) {
+            if (sessions.remove(s.uploadId) == null) continue;
+            try {
+                s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                        .bucket(bucket).key(s.key).uploadId(s.uploadId).build());
+            } catch (Exception e) {
+                System.err.println("multipart GC: abort failed for " + s.uploadId + ": " + e.getMessage());
+            }
+        }
     }
 
     private void listObjectsV2(Context ctx) {

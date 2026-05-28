@@ -218,6 +218,59 @@ def test_user_metadata_passthrough_get(s3, key):
     assert resp["Metadata"]["purpose"] == "testing"
 
 
+def test_delete_objects_batch(s3):
+    prefix = f"batch-delete/{uuid.uuid4()}/"
+    keys = [f"{prefix}{i}.txt" for i in range(5)]
+    for k in keys:
+        s3.put_object(Bucket=BUCKET, Key=k, Body=b"x")
+    resp = s3.delete_objects(
+        Bucket=BUCKET,
+        Delete={"Objects": [{"Key": k} for k in keys]},
+    )
+    deleted = sorted(d["Key"] for d in resp.get("Deleted", []))
+    assert deleted == sorted(keys)
+    for k in keys:
+        with pytest.raises(ClientError) as exc:
+            s3.head_object(Bucket=BUCKET, Key=k)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_get_bucket_location(s3):
+    resp = s3.get_bucket_location(Bucket=BUCKET)
+    assert "LocationConstraint" in resp
+
+
+def test_list_multipart_uploads(s3):
+    test_key = f"mpu-list/{uuid.uuid4()}.bin"
+    mp = s3.create_multipart_upload(Bucket=BUCKET, Key=test_key)
+    try:
+        resp = s3.list_multipart_uploads(Bucket=BUCKET)
+        ids = [u["UploadId"] for u in resp.get("Uploads", [])]
+        assert mp["UploadId"] in ids
+    finally:
+        s3.abort_multipart_upload(Bucket=BUCKET, Key=test_key, UploadId=mp["UploadId"])
+
+
+def test_list_parts(s3, key):
+    mp = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
+    try:
+        # Upload two parts; only part 1 is flushed upstream (part 2 stays buffered
+        # until next part or Complete arrives). ListParts shows what's upstream.
+        for n in (1, 2):
+            s3.upload_part(
+                Bucket=BUCKET,
+                Key=key,
+                UploadId=mp["UploadId"],
+                PartNumber=n,
+                Body=b"x" * (5 * 1024 * 1024),
+            )
+        resp = s3.list_parts(Bucket=BUCKET, Key=key, UploadId=mp["UploadId"])
+        assert resp["UploadId"] == mp["UploadId"]
+        assert any(p["PartNumber"] == 1 for p in resp.get("Parts", []))
+    finally:
+        s3.abort_multipart_upload(Bucket=BUCKET, Key=key, UploadId=mp["UploadId"])
+
+
 def test_user_metadata_passthrough_multipart(s3, key):
     body = b"y" * (5 * 1024 * 1024 + 3)
     mp = s3.create_multipart_upload(
