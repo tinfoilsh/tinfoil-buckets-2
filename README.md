@@ -30,7 +30,7 @@ PORT=9000
 ## Run
 
 - Local: `mvn compile exec:java`
-- Docker: `docker build -t tinfoil-buckets . && docker run --rm -p 9000:9000 --env-file .env tinfoil-buckets`
+- Docker: `docker build -t tinfoil-buckets . && docker run --rm -p 9000:9000 -v $(pwd)/.env:/app/.env tinfoil-buckets`
 
 ## Test
 
