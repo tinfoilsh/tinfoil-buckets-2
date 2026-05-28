@@ -147,9 +147,46 @@ def test_content_type_passthrough(s3, key):
 # --- Documented gaps (features not yet implemented) --------------------------
 
 
-@pytest.mark.xfail(reason="ListObjectsV2 not implemented yet", strict=True)
 def test_list_objects_v2(s3):
-    s3.list_objects_v2(Bucket=BUCKET)
+    prefix = f"list-test/{uuid.uuid4()}/"
+    keys = [f"{prefix}a.txt", f"{prefix}b.txt", f"{prefix}c.txt"]
+    try:
+        for k in keys:
+            s3.put_object(Bucket=BUCKET, Key=k, Body=b"hello")
+        resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+        assert resp["KeyCount"] == 3
+        assert resp["IsTruncated"] is False
+        assert sorted(obj["Key"] for obj in resp["Contents"]) == sorted(keys)
+        assert all(obj["Size"] == len(b"hello") for obj in resp["Contents"])
+    finally:
+        for k in keys:
+            s3.delete_object(Bucket=BUCKET, Key=k)
+
+
+def test_list_objects_v2_pagination(s3):
+    prefix = f"page-test/{uuid.uuid4()}/"
+    keys = [f"{prefix}{i:03d}.txt" for i in range(7)]
+    try:
+        for k in keys:
+            s3.put_object(Bucket=BUCKET, Key=k, Body=b"x")
+        page1 = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix, MaxKeys=3)
+        assert page1["KeyCount"] == 3
+        assert page1["IsTruncated"] is True
+        assert "NextContinuationToken" in page1
+        page2 = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix=prefix,
+            MaxKeys=3,
+            ContinuationToken=page1["NextContinuationToken"],
+        )
+        assert page2["KeyCount"] == 3
+        seen = [obj["Key"] for obj in page1["Contents"]] + [
+            obj["Key"] for obj in page2["Contents"]
+        ]
+        assert sorted(seen) == sorted(keys[:6])
+    finally:
+        for k in keys:
+            s3.delete_object(Bucket=BUCKET, Key=k)
 
 
 @pytest.mark.xfail(reason="HeadBucket not implemented yet", strict=True)

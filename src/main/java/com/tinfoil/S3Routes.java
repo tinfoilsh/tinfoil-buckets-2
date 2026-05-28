@@ -14,14 +14,18 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
+import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.model.SdkPartType;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
@@ -29,16 +33,15 @@ import software.amazon.encryption.s3.S3EncryptionClientException;
 
 public class S3Routes {
     private static final int GCM_TAG_BYTES = 16;
+    public static final long MAX_PART_BYTES = 1024L * 1024L * 1024L;
 
     private final S3Client s3;
     private final String bucket;
-    private final long maxPartBytes;
     private final ConcurrentHashMap<String, MultipartSession> sessions = new ConcurrentHashMap<>();
 
     public S3Routes(S3Client s3, Config config) {
         this.s3 = s3;
         this.bucket = config.bucket();
-        this.maxPartBytes = config.maxPartBytes();
     }
 
     public void register(Javalin app) {
@@ -47,6 +50,8 @@ public class S3Routes {
         app.head("/{bucket}/<key>", this::handleHead);
         app.delete("/{bucket}/<key>", this::handleDelete);
         app.post("/{bucket}/<key>", this::handlePost);
+        app.get("/{bucket}", this::handleBucketGet);
+        app.get("/{bucket}/", this::handleBucketGet);
 
         app.exception(S3Exception.class, S3Routes::handleS3Exception);
         app.exception(S3EncryptionClientException.class, (e, ctx) -> {
@@ -128,6 +133,83 @@ public class S3Routes {
         ctx.status(HttpStatus.NO_CONTENT);
     }
 
+    // --- Bucket-level operations ---------------------------------------------
+
+    private void handleBucketGet(Context ctx) {
+        String listType = ctx.queryParam("list-type");
+        if (!"2".equals(listType)) {
+            writeS3Error(ctx, 400, "InvalidRequest",
+                    "Only ListObjectsV2 (list-type=2) is supported.");
+            return;
+        }
+        listObjectsV2(ctx);
+    }
+
+    private void listObjectsV2(Context ctx) {
+        ListObjectsV2Request.Builder b = ListObjectsV2Request.builder().bucket(bucket);
+        String prefix = ctx.queryParam("prefix");
+        if (prefix != null) b.prefix(prefix);
+        String delimiter = ctx.queryParam("delimiter");
+        if (delimiter != null) b.delimiter(delimiter);
+        String maxKeys = ctx.queryParam("max-keys");
+        if (maxKeys != null) b.maxKeys(Integer.parseInt(maxKeys));
+        String continuationToken = ctx.queryParam("continuation-token");
+        if (continuationToken != null) b.continuationToken(continuationToken);
+        String startAfter = ctx.queryParam("start-after");
+        if (startAfter != null) b.startAfter(startAfter);
+
+        ListObjectsV2Response resp = s3.listObjectsV2(b.build());
+
+        String bucketParam = ctx.pathParam("bucket");
+        StringBuilder xml = new StringBuilder(512);
+        xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+        xml.append("<ListBucketResult>");
+        xml.append("<Name>").append(xmlEscape(bucketParam)).append("</Name>");
+        if (prefix != null) {
+            xml.append("<Prefix>").append(xmlEscape(prefix)).append("</Prefix>");
+        }
+        if (delimiter != null) {
+            xml.append("<Delimiter>").append(xmlEscape(delimiter)).append("</Delimiter>");
+        }
+        xml.append("<KeyCount>").append(resp.keyCount() != null ? resp.keyCount() : 0).append("</KeyCount>");
+        xml.append("<MaxKeys>").append(resp.maxKeys() != null ? resp.maxKeys() : 1000).append("</MaxKeys>");
+        xml.append("<IsTruncated>").append(Boolean.TRUE.equals(resp.isTruncated())).append("</IsTruncated>");
+        if (continuationToken != null) {
+            xml.append("<ContinuationToken>").append(xmlEscape(continuationToken)).append("</ContinuationToken>");
+        }
+        if (resp.nextContinuationToken() != null) {
+            xml.append("<NextContinuationToken>").append(xmlEscape(resp.nextContinuationToken())).append("</NextContinuationToken>");
+        }
+        if (resp.contents() != null) {
+            for (S3Object obj : resp.contents()) {
+                xml.append("<Contents>");
+                xml.append("<Key>").append(xmlEscape(obj.key())).append("</Key>");
+                if (obj.lastModified() != null) {
+                    xml.append("<LastModified>").append(obj.lastModified().toString()).append("</LastModified>");
+                }
+                if (obj.eTag() != null) {
+                    xml.append("<ETag>").append(xmlEscape(obj.eTag())).append("</ETag>");
+                }
+                // Size is ciphertext size; subtract GCM tag for plaintext.
+                long size = obj.size() != null ? Math.max(0, obj.size() - GCM_TAG_BYTES) : 0;
+                xml.append("<Size>").append(size).append("</Size>");
+                xml.append("<StorageClass>STANDARD</StorageClass>");
+                xml.append("</Contents>");
+            }
+        }
+        if (resp.commonPrefixes() != null) {
+            for (CommonPrefix cp : resp.commonPrefixes()) {
+                xml.append("<CommonPrefixes>");
+                xml.append("<Prefix>").append(xmlEscape(cp.prefix())).append("</Prefix>");
+                xml.append("</CommonPrefixes>");
+            }
+        }
+        xml.append("</ListBucketResult>");
+
+        ctx.contentType("application/xml");
+        ctx.result(xml.toString());
+    }
+
     // --- Multipart operations ------------------------------------------------
 
     private void createMultipartUpload(Context ctx) {
@@ -158,15 +240,15 @@ public class S3Routes {
         }
         int partNumber = Integer.parseInt(ctx.queryParam("partNumber"));
         long claimedLength = ctx.contentLength();
-        if (claimedLength > maxPartBytes) {
+        if (claimedLength > MAX_PART_BYTES) {
             writeS3Error(ctx, 400, "EntityTooLarge",
-                    "Part size exceeds MAX_PART_BYTES (" + maxPartBytes + ").");
+                    "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
             return;
         }
         byte[] body = ctx.bodyAsBytes();
-        if (body.length > maxPartBytes) {
+        if (body.length > MAX_PART_BYTES) {
             writeS3Error(ctx, 400, "EntityTooLarge",
-                    "Part size exceeds MAX_PART_BYTES (" + maxPartBytes + ").");
+                    "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
             return;
         }
 
