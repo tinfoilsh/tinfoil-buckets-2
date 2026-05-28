@@ -35,3 +35,4 @@ PORT=9000
 ## Test
 
 `./test.sh` runs PUT / HEAD / GET / DELETE against a running server and checks the round-trip.
+`client/` contains the python S3 sdk

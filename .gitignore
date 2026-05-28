@@ -3,3 +3,5 @@ target/
 *.iml
 .vscode/
 .env
+
+client/.venv/
