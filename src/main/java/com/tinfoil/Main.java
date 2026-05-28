@@ -8,7 +8,9 @@ public class Main {
         Config config = Config.load();
         S3Client s3 = S3Clients.encrypted(config);
 
-        Javalin app = Javalin.create();
+        Javalin app = Javalin.create(cfg -> {
+            cfg.http.maxRequestSize = config.maxPartBytes();
+        });
         new S3Routes(s3, config).register(app);
         app.start(config.port());
 
