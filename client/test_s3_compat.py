@@ -386,31 +386,6 @@ def test_range_get(s3, key):
     assert resp["Body"].read() == b"2345"
 
 
-# --- Streaming GET + client -------------------------------------------
-
-
-def test_streaming_get_trailer_ok(s3, key):
-    """Happy path: trailer says 'ok' and verified_get returns bytes unchanged."""
-    from tinfoil_client import verified_get
-
-    body = b"streaming-payload-" * 100  # ~1.8 KiB
-    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
-    got = verified_get(s3, Bucket=BUCKET, Key=key)
-    assert got == body
-
-
-def test_streaming_get_iter_chunks(s3, key):
-    """verified_iter yields the full plaintext across chunks."""
-    from tinfoil_client import verified_iter
-
-    body = (b"A" * (256 * 1024)) + (b"B" * (256 * 1024))  # 512 KiB
-    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
-    chunks = list(verified_iter(s3, Bucket=BUCKET, Key=key, chunk_size=64 * 1024))
-    assert b"".join(chunks) == body
-    # Should be more than one chunk for a 512 KiB body at 64 KiB chunks
-    assert len(chunks) > 1
-
-
 # --- Mode-specific tests (opt-in via env vars) -------------------------------
 # These tests verify behavior that depends on how the sidecar was started.
 # Both are skipped by default. To run them, restart the sidecar in the matching
@@ -459,6 +434,21 @@ def test_delayed_auth_streams_with_ok_trailer(s3, key):
     body = b"delayed-auth-payload" * 50_000  # ~1 MiB
     s3.put_object(Bucket=BUCKET, Key=key, Body=body)
     assert verified_get(s3, Bucket=BUCKET, Key=key) == body
+
+
+@pytest.mark.skipif(
+    not SIDECAR_DELAYED_AUTH,
+    reason="Set SIDECAR_DELAYED_AUTH=true when sidecar runs with DANGEROUS_DELAYED_AUTH=true.",
+)
+def test_delayed_auth_verified_iter_yields_clean_plaintext(s3, key):
+    """verified_iter must strip the 4-byte marker; concatenated chunks == plaintext."""
+    from tinfoil_client import verified_iter
+
+    body = (b"A" * (256 * 1024)) + (b"B" * (256 * 1024))  # 512 KiB
+    s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+    chunks = list(verified_iter(s3, Bucket=BUCKET, Key=key, chunk_size=64 * 1024))
+    assert b"".join(chunks) == body
+    assert len(chunks) > 1
 
 
 @pytest.mark.skipif(

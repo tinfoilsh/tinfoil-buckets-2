@@ -12,7 +12,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
@@ -59,12 +58,16 @@ import software.amazon.encryption.s3.S3EncryptionClientException;
 public class S3Routes {
     private static final int GCM_TAG_BYTES = 16;
     public static final long MAX_PART_BYTES = 1024L * 1024L * 1024L;
+    private static final byte[] MARKER_OK = {'T', 'F', 'O', 'K'};
+    private static final byte[] MARKER_FAIL = {'T', 'F', 'N', 'G'};
+    public static final int MARKER_BYTES = 4;
     private static final long MULTIPART_SESSION_TTL_SECONDS = 3600;
     private static final long MULTIPART_GC_PERIOD_SECONDS = 300;
 
     private final S3Client s3;
     private final String bucket;
     private final Region region;
+    private final boolean delayedAuth;
     private final ConcurrentHashMap<String, MultipartSession> sessions = new ConcurrentHashMap<>();
     private final ScheduledExecutorService gc = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "tinfoil-mpu-gc");
@@ -76,6 +79,7 @@ public class S3Routes {
         this.s3 = s3;
         this.bucket = config.bucket();
         this.region = config.region();
+        this.delayedAuth = config.delayedAuth();
     }
 
     public void register(Javalin app) {
@@ -172,11 +176,18 @@ public class S3Routes {
         }
         String key = ctx.pathParam("key");
 
-        // Trailer is always announced — the buffered path will always emit
-        // "ok"  for parity; the delayed-auth path emits "ok" or "fail" based on the end-of-stream check.
-        AtomicReference<String> authResult = new AtomicReference<>("fail");
-        ctx.header("Trailer", "X-Tinfoil-Auth");
-        ctx.res().setTrailerFields(() -> Map.of("X-Tinfoil-Auth", authResult.get()));
+        // In DEFAULT (buffered) mode: the encryption client verifies the GCM
+        // tag before any byte is released, so a successful response is
+        // already trustworthy. No marker is appended — clients get clean
+        // plaintext bytes exactly as stored.
+        //
+        // In DANGEROUS_DELAYED_AUTH mode: plaintext streams to the client
+        // before the GCM tag is verified. We append a 4-byte marker to the
+        // body so trailer-aware clients can detect tampering:
+        //   "TFOK" on success, "TFNG" on auth failure at end-of-stream.
+        // (We originally tried HTTP trailers but Jetty drops the connection
+        // mid-stream when trailers are configured on chunked responses
+        // larger than a few KiB.)
         try {
             s3.getObject(b -> b.bucket(bucket).key(key), (response, in) -> {
                 if (response.contentType() != null) ctx.contentType(response.contentType());
@@ -187,22 +198,21 @@ public class S3Routes {
                 }
                 return response;
             });
-            authResult.set("ok");
+            // Auth verified — append the success marker (delayed-auth only).
+            if (delayedAuth) {
+                try { ctx.outputStream().write(MARKER_OK); } catch (java.io.IOException ignored) {}
+            }
         } catch (S3EncryptionClientException e) {
-            // Upstream error (NoSuchKey etc.) — throws before bytes flow, so
-            // the normal exception path can write a clean error response.
-            if (e.getCause() instanceof S3Exception) {
-                throw e;
-            }
-            // Auth/buffer-exceeded failure.
-            // If the response is already committed (delayed-auth mode, bytes
-            // started flowing) we can't write a fresh error — leave
-            // authResult="fail" so the trailer goes out as "fail".
-            // If not committed yet (buffered mode failed before transferring)
-            // re-throw so the global handler returns an S3 XML error.
+            if (e.getCause() instanceof S3Exception) throw e;
             if (!ctx.res().isCommitted()) {
+                // No bytes flowed yet (buffered mode failed before transfer) —
+                // fail with a clean S3 XML error response.
                 throw e;
             }
+            // Mid-stream auth failure (only possible in delayed-auth mode) —
+            // append the fail marker for trailer-aware clients. Trailer-blind
+            // clients accept the risk.
+            try { ctx.outputStream().write(MARKER_FAIL); } catch (java.io.IOException ignored) {}
         }
     }
 
