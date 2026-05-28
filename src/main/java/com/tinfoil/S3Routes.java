@@ -98,6 +98,12 @@ public class S3Routes {
         app.exception(S3EncryptionClientException.class, (e, ctx) -> {
             if (e.getCause() instanceof S3Exception s3e) {
                 handleS3Exception(s3e, ctx);
+            } else if (e.getMessage() != null
+                    && e.getMessage().contains("exceeds the maximum buffer size")) {
+                writeS3Error(ctx, 413, "EntityTooLarge",
+                        "Object exceeds the sidecar's BUFFER_SIZE. "
+                        + "Raise BUFFER_SIZE (up to 64 GiB), or set "
+                        + "DELAYED_AUTH=true to stream (supports arbitrarily large objects.)");
             } else {
                 writeS3Error(ctx, 500, "InternalError", e.getMessage());
             }
