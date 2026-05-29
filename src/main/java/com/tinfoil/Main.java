@@ -14,7 +14,7 @@ public class Main {
         routes.register(app);
         app.start(config.port());
 
-        System.out.println("tinfoil-buckets listening on :" + config.port()
+        System.out.println("tinfoil-buckets-sidecar listening on :" + config.port()
                 + " -> s3://" + config.bucket());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

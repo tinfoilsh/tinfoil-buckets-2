@@ -19,7 +19,7 @@ on:
         type: string
 
 concurrency:
-  group: tinfoil-buckets-release-${{ inputs.version }}
+  group: tinfoil-buckets-sidecar-release-${{ inputs.version }}
 
 jobs:
   build:

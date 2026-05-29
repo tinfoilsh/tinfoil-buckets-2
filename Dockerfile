@@ -7,6 +7,6 @@ RUN mvn -B package -DskipTests
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app
-COPY --from=build /app/target/tinfoil-buckets-0.1.0.jar /app/app.jar
+COPY --from=build /app/target/tinfoil-buckets-sidecar-0.1.0.jar /app/app.jar
 EXPOSE 9000
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]

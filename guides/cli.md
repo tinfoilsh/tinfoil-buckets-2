@@ -11,7 +11,7 @@ docker run --rm -d --name buckets -p 9000:9000 \
   -e AWS_ACCESS_KEY_ID=<aws key> \
   -e AWS_SECRET_ACCESS_KEY=<aws secret> \
   -e ENCRYPTION_KEY=<base64 32-byte AES key> \
-  ghcr.io/tinfoilsh/tinfoil-buckets-2:latest
+  ghcr.io/tinfoilsh/tinfoil-buckets-sidecar:latest
 ```
 
 ## Configure the CLI
