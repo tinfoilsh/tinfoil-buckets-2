@@ -7,13 +7,14 @@ public class Main {
     public static void main(String[] args) {
         Config config = Config.load();
 
-        // In single-tenant mode, build one client up front.
-        // In multitenant mode, the cache builds clients lazily per key.
-        S3Client s3 = config.multitenant() ? null : S3Clients.encrypted(config);
-        TenantClients tenants = config.multitenant() ? new TenantClients(config) : null;
+        // Pick a resolver strategy. Single-tenant holds one pre-built encryption
+        // client; multitenant holds a per-key LRU and parses headers per request.
+        TenantResolver resolver = config.multitenant()
+                ? new MultiTenantResolver(new TenantClients(config))
+                : new SingleTenantResolver(S3Clients.encrypted(config));
 
         // Non-encryption S3 client used for housekeeping ops
-        S3Client housekeeping = S3Client.builder()
+        S3Client housekeepingClient = S3Client.builder()
                 .region(config.region())
                 .credentialsProvider(config.creds())
                 .build();
@@ -21,7 +22,7 @@ public class Main {
         Javalin app = Javalin.create(cfg -> {
             cfg.http.maxRequestSize = S3Routes.MAX_PART_BYTES;
         });
-        S3Routes routes = new S3Routes(s3, tenants, housekeeping, config);
+        S3Routes routes = new S3Routes(resolver, housekeepingClient, config);
         routes.register(app);
         app.start(config.port());
 
@@ -32,9 +33,8 @@ public class Main {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             app.stop();
             routes.shutdown();
-            if (s3 != null) s3.close();
-            if (tenants != null) tenants.close();
-            housekeeping.close();
+            try { resolver.close(); } catch (Exception ignored) {}
+            housekeepingClient.close();
         }));
     }
 }
