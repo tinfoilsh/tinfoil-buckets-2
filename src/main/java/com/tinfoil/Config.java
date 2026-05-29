@@ -27,15 +27,14 @@ public record Config(
     public static Config load() {
         Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
         boolean multitenant = parseBool(dotenv.get("MULTITENANT"), false);
-        // In multitenant mode the encryption key arrives per-request in a
-        // header, so a startup-time ENCRYPTION_KEY is neither required nor used.
+        // In multitenant mode the encryption key arrives per-request 
         String envKey = dotenv.get("ENCRYPTION_KEY");
         SecretKey aesKey;
         if (multitenant) {
             aesKey = null;
         } else {
             if (envKey == null || envKey.isEmpty()) {
-                throw new IllegalStateException("Missing ENCRYPTION_KEY (set it in .env, or enable MULTITENANT=true)");
+                throw new IllegalStateException("Missing ENCRYPTION_KEY on startup (set it in .env, or enable MULTITENANT=true)");
             }
             aesKey = loadAesKey(envKey);
         }

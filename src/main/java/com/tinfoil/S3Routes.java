@@ -115,9 +115,7 @@ public class S3Routes {
             if (e.getCause() instanceof S3Exception s3e) {
                 handleS3Exception(s3e, ctx);
             } else if (isAeadAuthFailure(e)) {
-                // GCM tag mismatch: the supplied key cannot decrypt this object.
-                // Safe to surface — the caller already authenticated as this tenant
-                // (and would be the owner of any object under their prefix).
+                // GCM tag mismatch: the supplied key cannot decrypt this object. Safe to surface
                 writeS3Error(ctx, 400, "DecryptionFailed",
                         "Decryption failed for this object. The provided encryption key "
                         + "cannot decrypt it (the object may have been encrypted with a "
