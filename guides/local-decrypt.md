@@ -2,13 +2,61 @@
 
 For operator-side tooling — viewing runs, auditing, migrating — you don't need to run Docker. A short Python helper (~50 lines) decrypts S3 objects directly, given the same master key the sidecar was started with.
 
-**Scope:** decrypt only. Encrypt is more code. Just use the sidecar.
+**Scope:** decrypt only. Encrypt is more code & easier to mess up. Just use the sidecar for that.
 
 ## The helper
 
-A reference implementation lives in [`tinfoil-persistent-storage-example/tinfoil_crypto.py`](https://github.com/tinfoilsh/tinfoil-persistent-storage-example/blob/main/tinfoil_crypto.py). Drop it next to your script — single file, depends only on `cryptography` and `boto3`.
+Drop this next to your script — single file, depends only on `cryptography` and `boto3`. Targets the v4 default suite (`ALG_AES_256_GCM_HKDF_SHA512_COMMIT_KEY`, id 0x0073). If the sidecar ever moves to a different suite, this has to follow.
 
-Targets the v4 default suite (`ALG_AES_256_GCM_HKDF_SHA512_COMMIT_KEY`, id 0x0073). If the sidecar ever moves to a different suite, the helper has to follow.
+```python
+# tinfoil_crypto.py
+import base64
+import hmac
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+_SUITE_ID_BYTES = b"\x00\x73"            # content-AAD + first 2 bytes of HKDF info
+_SUITE_ID_DEC = b"115"                   # key-wrap AAD (decimal int as UTF-8)
+_DERIVE_KEY_INFO = _SUITE_ID_BYTES + b"DERIVEKEY"
+_COMMIT_KEY_INFO = _SUITE_ID_BYTES + b"COMMITKEY"
+_COMMIT_LEN = 28
+_DK_LEN = 32
+_FIXED_CONTENT_IV = b"\x01" * 12
+
+
+def decrypt_object(master_key: bytes, metadata: dict, body: bytes) -> bytes:
+    """Decrypt one S3 object body given the master key, boto3 metadata dict, and ciphertext."""
+    edk = base64.b64decode(metadata["x-amz-3"])
+    iv, edk_ct = edk[:12], edk[12:]
+    pdk = AESGCM(master_key).decrypt(iv, edk_ct, _SUITE_ID_DEC)
+    if len(pdk) != _DK_LEN:
+        raise ValueError(f"unexpected data key length {len(pdk)}")
+
+    message_id = base64.b64decode(metadata["x-amz-i"])
+    stored_commitment = base64.b64decode(metadata["x-amz-d"])
+
+    derived_commitment = HKDF(
+        algorithm=hashes.SHA512(),
+        length=_COMMIT_LEN,
+        salt=message_id,
+        info=_COMMIT_KEY_INFO,
+    ).derive(pdk)
+    if not hmac.compare_digest(derived_commitment, stored_commitment):
+        raise ValueError("key commitment mismatch — wrong key or tampered object")
+
+    cek = HKDF(
+        algorithm=hashes.SHA512(),
+        length=_DK_LEN,
+        salt=message_id,
+        info=_DERIVE_KEY_INFO,
+    ).derive(pdk)
+
+    return AESGCM(cek).decrypt(_FIXED_CONTENT_IV, body, _SUITE_ID_BYTES)
+```
+
+A working example that uses this against real S3 objects: [`view.py` in tinfoil-persistent-storage-example](https://github.com/tinfoilsh/tinfoil-persistent-storage-example/blob/main/view.py).
 
 ## Usage
 
