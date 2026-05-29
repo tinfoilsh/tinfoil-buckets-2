@@ -205,6 +205,11 @@ public class S3Routes {
             listParts(ctx, uploadId);
             return;
         }
+        if (ctx.header("Range") != null) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "Range requests are not supported (encrypted objects can't be read in slices).");
+            return;
+        }
         TenantCtx tenant = resolver.resolve(ctx);
         if (tenant == null) return;
         String userKey = ctx.pathParam("key");
