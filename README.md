@@ -2,6 +2,14 @@ Tinfoil Buckets Sidecar.
 
 Simple server that exposes an S3 API to the local network. Internally uses S3 encrypted client. Encrypts & decrypts. Made to run as a side-car container on an enclave.
 
+! Gotchas
+The most obvious differences from normal S3:
+
+- **Sequential multipart only** (`max_concurrency=1`)
+- **Non-last multipart parts must be 16-byte aligned.**
+- **No ranged GETs.**
+- **GET buffers the whole object** (default 1 GiB). Raise up to 64 GiB or stream via `DANGEROUS_DELAYED_AUTH=true`.
+
 ## Usage
 
 1. Inside a tinfoil secure enclave. See our [persistent-storage-example](https://github.com/tinfoilsh/tinfoil-persistent-storage-example).
