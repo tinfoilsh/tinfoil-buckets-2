@@ -4,9 +4,9 @@ Simple server that exposes an S3 API to the local network. Internally uses S3 en
 
 ## Usage
 
-1. Inside a tinfoil secure enclave. See our [persistent-storage-example](https://github.com/tinfoilsh/tinfoil-persistent-storage-example)
-2. Spun up locally inside a docker container: then pointing the aws CLI or any aws SDK towards localhost:9000.
-3. Finally, for local reading of encrypted files directly from S3, you can also use a teensie python crypto implementation. TODO: copy this from persistent storage into the tinfoil CLI.
+1. Inside a tinfoil secure enclave. See our [persistent-storage-example](https://github.com/tinfoilsh/tinfoil-persistent-storage-example).
+2. Spun up locally inside a docker container, then pointing the aws CLI or any S3 SDK towards `localhost:9000`. See [`guides/cli.md`](guides/cli.md) and [`guides/sdk.md`](guides/sdk.md).
+3. For local reading of encrypted files directly from S3 (no sidecar), use the teensie Python decrypt helper. See [`guides/local-decrypt.md`](guides/local-decrypt.md). TODO: copy this from persistent storage into the tinfoil CLI.
 
 ## Notes
 
