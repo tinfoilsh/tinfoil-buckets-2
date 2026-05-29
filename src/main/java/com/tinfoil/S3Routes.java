@@ -102,8 +102,12 @@ public class S3Routes {
         gc.scheduleAtFixedRate(this::sweepSessions,
                 MULTIPART_GC_PERIOD_SECONDS, MULTIPART_GC_PERIOD_SECONDS, TimeUnit.SECONDS);
 
-        app.exception(S3Exception.class, S3Routes::handleS3Exception);
+        app.exception(S3Exception.class, (e, ctx) -> {
+            e.printStackTrace();
+            handleS3Exception(e, ctx);
+        });
         app.exception(S3EncryptionClientException.class, (e, ctx) -> {
+            e.printStackTrace();
             if (e.getCause() instanceof S3Exception s3e) {
                 handleS3Exception(s3e, ctx);
             } else if (e.getMessage() != null
@@ -115,6 +119,10 @@ public class S3Routes {
             } else {
                 writeS3Error(ctx, 500, "InternalError", e.getMessage());
             }
+        });
+        app.exception(Exception.class, (e, ctx) -> {
+            e.printStackTrace();
+            writeS3Error(ctx, 500, "InternalError", e.getMessage());
         });
     }
 
@@ -203,6 +211,10 @@ public class S3Routes {
             s3.getObject(b -> b.bucket(bucket).key(key), (response, in) -> {
                 if (response.contentType() != null) ctx.contentType(response.contentType());
                 if (response.eTag() != null) ctx.header("ETag", response.eTag());
+                if (response.lastModified() != null) {
+                    ctx.header("Last-Modified", java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
+                            .format(response.lastModified().atZone(java.time.ZoneOffset.UTC)));
+                }
                 writeUserMetadataHeaders(ctx, response.metadata());
                 try (var stream = in) {
                     stream.transferTo(ctx.outputStream());
@@ -236,6 +248,10 @@ public class S3Routes {
         ctx.header("Content-Length", String.valueOf(len));
         if (resp.contentType() != null) ctx.contentType(resp.contentType());
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
+        if (resp.lastModified() != null) {
+            ctx.header("Last-Modified", java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
+                    .format(resp.lastModified().atZone(java.time.ZoneOffset.UTC)));
+        }
         writeUserMetadataHeaders(ctx, resp.metadata());
         ctx.status(HttpStatus.OK);
     }
@@ -579,6 +595,20 @@ public class S3Routes {
             }
 
             if (session.pendingPartBytes != null) {
+                // The previous pending part is about to be flushed as a
+                // non-last part. The S3 Encryption Client requires non-last
+                // parts to be a multiple of the AES block size (16 bytes).
+                if (session.pendingPartBytes.length % 16 != 0) {
+                    writeS3Error(ctx, 400, "InvalidArgument",
+                            "Previous part (partNumber=" + session.pendingPartNumber
+                                    + ") was " + session.pendingPartBytes.length
+                                    + " bytes, which is not a multiple of 16. "
+                                    + "Only the final multipart part may have an unaligned size. "
+                                    + "Pad part " + session.pendingPartNumber
+                                    + " to a multiple of 16 bytes, or finish the upload "
+                                    + "with CompleteMultipartUpload (treating it as the last part).");
+                    return;
+                }
                 CompletedPart cp = flushPart(session, false);
                 session.completedParts.add(cp);
             }
