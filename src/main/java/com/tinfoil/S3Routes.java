@@ -488,11 +488,8 @@ public class S3Routes {
             if (s.createdAt.isBefore(cutoff)) expired.add(s);
         }
         for (MultipartSession s : expired) {
-            // The TenantCtx helpers aren't available here (no request context).
-            // Reproduce the same prefixing rules directly off the session fields.
-            String sessKey = s.tenantId == null ? s.uploadId : s.tenantId + ":" + s.uploadId;
-            if (sessions.remove(sessKey) == null) continue;
-            String s3K = s.tenantId == null ? s.key : s.tenantId + "/" + s.key;
+            if (sessions.remove(TenantCtx.sessionKeyFor(s.tenantId, s.uploadId)) == null) continue;
+            String s3K = TenantCtx.s3KeyFor(s.tenantId, s.key);
             try {
                 // Abort is not crypto-aware — housekeeping client works in either mode.
                 housekeepingClient.abortMultipartUpload(AbortMultipartUploadRequest.builder()

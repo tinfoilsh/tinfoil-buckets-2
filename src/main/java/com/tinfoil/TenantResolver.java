@@ -25,24 +25,26 @@ public interface TenantResolver extends AutoCloseable {
      */
     record TenantCtx(S3Client client, String tenantId) {
         /** Storage key for an S3 op: prepends the tenant prefix in multitenant mode. */
-        public String s3Key(String userKey) {
+        public String s3Key(String userKey)        { return s3KeyFor(tenantId, userKey); }
+        /** Prefix used to scope List* operations. Empty in single-tenant mode. */
+        public String prefix()                     { return prefixFor(tenantId); }
+        /** Map key for the multipart-session table. Different tenants' uploadIds never collide. */
+        public String sessionKey(String uploadId)  { return sessionKeyFor(tenantId, uploadId); }
+        /** Strips the tenant prefix off an S3 key before echoing back in a list response. */
+        public String stripPrefix(String key)      { return stripPrefixFor(tenantId, key); }
+
+        public static String s3KeyFor(String tenantId, String userKey) {
             return tenantId == null ? userKey : tenantId + "/" + userKey;
         }
-
-        /** Prefix used to scope List* operations. Empty in single-tenant mode. */
-        public String prefix() {
+        public static String prefixFor(String tenantId) {
             return tenantId == null ? "" : tenantId + "/";
         }
-
-        /** Map key for the multipart-session table. Different tenants' uploadIds never collide. */
-        public String sessionKey(String uploadId) {
+        public static String sessionKeyFor(String tenantId, String uploadId) {
             return tenantId == null ? uploadId : tenantId + ":" + uploadId;
         }
-
-        /** Strips the tenant prefix off an S3 key before echoing back in a list response. */
-        public String stripPrefix(String key) {
+        public static String stripPrefixFor(String tenantId, String key) {
             if (tenantId == null || key == null) return key;
-            String p = prefix();
+            String p = prefixFor(tenantId);
             return key.startsWith(p) ? key.substring(p.length()) : key;
         }
     }
