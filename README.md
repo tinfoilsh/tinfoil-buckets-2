@@ -88,3 +88,5 @@ SIDECAR_DELAYED_AUTH=true client/.venv/bin/pytest -v client/test_s3_compat.py -k
    1. The implementation of this looks like:
       1. By default, we are in buffer mode. The environment variable defaults to 1gb, but can go up to 64gb reflecting the underlying clients maxBufferSize (or whatever it's called). If users try and GET something larger than bufferSize, it returns a helpful error message
       2. If users need to get something larger than 64Gb, or don't want memory pressure in their server, then they can pass delayedAuth. This turns on delayedAuth on the client, and streams everything. In this mode, the client is responsible for doing a special get that handles the trailer if the data turns out to be bad. This is a user-beware feature.
+8. non-last part uploads must be in multiples of 16 bytes. We return an error if one is not. For the high level multipart apis (eg client has big object, just split it up however) this should be fine - they typically use 8MiB
+   1. The error is: `400 InvalidArgument` on the _next_ `UploadPart` call (that's when we know it's not last)
