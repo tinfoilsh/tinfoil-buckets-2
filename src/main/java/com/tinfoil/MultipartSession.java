@@ -10,6 +10,7 @@ import software.amazon.awssdk.services.s3.model.CompletedPart;
 public class MultipartSession {
     public final String uploadId;
     public final String key;
+    public final String tenantId; // null in single-tenant mode
     public final Instant createdAt = Instant.now();
     public final ReentrantLock lock = new ReentrantLock();
 
@@ -19,8 +20,9 @@ public class MultipartSession {
     public String pendingPartEtag = null;
     public final List<CompletedPart> completedParts = new ArrayList<>();
 
-    public MultipartSession(String uploadId, String key) {
+    public MultipartSession(String uploadId, String key, String tenantId) {
         this.uploadId = uploadId;
         this.key = key;
+        this.tenantId = tenantId;
     }
 }
