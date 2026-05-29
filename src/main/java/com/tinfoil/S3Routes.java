@@ -211,6 +211,10 @@ public class S3Routes {
             s3.getObject(b -> b.bucket(bucket).key(key), (response, in) -> {
                 if (response.contentType() != null) ctx.contentType(response.contentType());
                 if (response.eTag() != null) ctx.header("ETag", response.eTag());
+                if (response.lastModified() != null) {
+                    ctx.header("Last-Modified", java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
+                            .format(response.lastModified().atZone(java.time.ZoneOffset.UTC)));
+                }
                 writeUserMetadataHeaders(ctx, response.metadata());
                 try (var stream = in) {
                     stream.transferTo(ctx.outputStream());
@@ -244,6 +248,10 @@ public class S3Routes {
         ctx.header("Content-Length", String.valueOf(len));
         if (resp.contentType() != null) ctx.contentType(resp.contentType());
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
+        if (resp.lastModified() != null) {
+            ctx.header("Last-Modified", java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
+                    .format(resp.lastModified().atZone(java.time.ZoneOffset.UTC)));
+        }
         writeUserMetadataHeaders(ctx, resp.metadata());
         ctx.status(HttpStatus.OK);
     }
