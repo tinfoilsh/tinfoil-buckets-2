@@ -1,19 +1,19 @@
-Simple SOTA AWS implementation of encrypted buckets server. Made to run as a side-car container on an enclave.
+Tinfoil Buckets Sidecar.
 
-## Plan
+Simple server that exposes an S3 API to the local network. Internally uses S3 encrypted client. Encrypts & decrypts. Made to run as a side-car container on an enclave.
 
-Boots up with a key (tbd on how it gets there).
+## Usage
 
-Exposes an S3 api to the local network, and sends/gets encrypted requests from S3. All a caller does is the equivalent of S3 but pointing to a different network (and with no auth).
-
-Ideally we can just point the URl & not mess around with the any s3 sdk, so that any language can do this..
+1. Inside a tinfoil secure enclave. See our [persistent-storage-example](https://github.com/tinfoilsh/tinfoil-persistent-storage-example)
+2. Spun up locally inside a docker container: then pointing the aws CLI or any aws SDK towards localhost:9000.
+3. Finally, for local reading of encrypted files directly from S3, you can also use a teensie python crypto implementation. TODO: copy this from persistent storage into the tinfoil CLI.
 
 ## Notes
 
 - **Path-style only.** Configure your S3 SDK with `forcePathStyle: true` (or equivalent). Virtual-hosted (`bucket.s3.amazonaws.com`) URLs are not supported.
 - **Single backing bucket for now.** All requests route to the bucket configured on the sidecar server via `BUCKET`; the bucket name in the request URL is currently ignored. (Future: per-request bucket selection.)
 - **No auth.** sigv4 signatures from clients are accepted and discarded.
-- When GET-ing large files, users need to use a special client. Otherwise, any S3 sdk should work.
+- When GET-ing large files, users need to use a special client. Aside from that, any S3 sdk should work.
 
 ## Configure
 
