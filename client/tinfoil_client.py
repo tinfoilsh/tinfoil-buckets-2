@@ -1,4 +1,4 @@
-"""Tamper-detecting GET helpers for the tinfoil-buckets sidecar.
+"""Tamper-detecting GET helpers for the tinfoil-buckets-sidecar.
 
 Only relevant when the sidecar is started with DANGEROUS_DELAYED_AUTH=true.
 In that mode plaintext is streamed to the client before the GCM tag is

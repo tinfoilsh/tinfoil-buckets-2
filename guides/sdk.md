@@ -1,4 +1,4 @@
-# Using an S3 SDK with tinfoil-buckets
+# Using an S3 SDK with tinfoil-buckets-sidecar
 
 Same shape as the [CLI guide](cli.md): run buckets in Docker, point any S3 SDK at it.
 The same three constraints apply, expressed in code instead of a config file.
