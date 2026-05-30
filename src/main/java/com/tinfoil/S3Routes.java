@@ -12,12 +12,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import javax.crypto.BadPaddingException;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.w3c.dom.Document;
 import org.w3c.dom.NodeList;
 
+import com.tinfoil.TenantResolver.TenantCtx;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HandlerType;
@@ -64,7 +66,8 @@ public class S3Routes {
     private static final long MULTIPART_SESSION_TTL_SECONDS = 3600;
     private static final long MULTIPART_GC_PERIOD_SECONDS = 300;
 
-    private final S3Client s3;
+    private final TenantResolver resolver;
+    private final S3Client housekeepingClient; 
     private final String bucket;
     private final Region region;
     private final boolean delayedAuth;
@@ -75,8 +78,9 @@ public class S3Routes {
         return t;
     });
 
-    public S3Routes(S3Client s3, Config config) {
-        this.s3 = s3;
+    public S3Routes(TenantResolver resolver, S3Client housekeepingClient, Config config) {
+        this.resolver = resolver;
+        this.housekeepingClient = housekeepingClient;
         this.bucket = config.bucket();
         this.region = config.region();
         this.delayedAuth = config.delayedAuth();
@@ -110,6 +114,12 @@ public class S3Routes {
             e.printStackTrace();
             if (e.getCause() instanceof S3Exception s3e) {
                 handleS3Exception(s3e, ctx);
+            } else if (isAeadAuthFailure(e)) {
+                // GCM tag mismatch: the supplied key cannot decrypt this object. Safe to surface
+                writeS3Error(ctx, 400, "DecryptionFailed",
+                        "Decryption failed for this object. The provided encryption key "
+                        + "cannot decrypt it (the object may have been encrypted with a "
+                        + "different key).");
             } else if (e.getMessage() != null
                     && e.getMessage().contains("exceeds the maximum buffer size")) {
                 writeS3Error(ctx, 413, "EntityTooLarge",
@@ -159,7 +169,9 @@ public class S3Routes {
     // --- Single-shot object operations ---------------------------------------
 
     private void putObject(Context ctx) {
-        String key = ctx.pathParam("key");
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        String userKey = ctx.pathParam("key");
         String lenHeader = ctx.header("Content-Length");
         if (lenHeader == null) {
             writeS3Error(ctx, 411, "MissingContentLength",
@@ -175,13 +187,13 @@ public class S3Routes {
             return;
         }
 
-        PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(key);
+        PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(tenant.s3Key(userKey));
         String contentType = ctx.header("Content-Type");
         if (contentType != null) b.contentType(contentType);
         Map<String, String> userMeta = extractUserMetadata(ctx);
         if (!userMeta.isEmpty()) b.metadata(userMeta);
 
-        PutObjectResponse resp = s3.putObject(b.build(),
+        PutObjectResponse resp = tenant.client().putObject(b.build(),
                 RequestBody.fromInputStream(ctx.bodyInputStream(), contentLength));
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
         ctx.status(HttpStatus.OK);
@@ -193,7 +205,15 @@ public class S3Routes {
             listParts(ctx, uploadId);
             return;
         }
-        String key = ctx.pathParam("key");
+        if (ctx.header("Range") != null) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "Range requests are not supported (encrypted objects can't be read in slices).");
+            return;
+        }
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        String userKey = ctx.pathParam("key");
+        String s3K = tenant.s3Key(userKey);
 
         // In DEFAULT (buffered) mode: the encryption client verifies the GCM
         // tag before any byte is released, so a successful response is
@@ -208,7 +228,7 @@ public class S3Routes {
         // mid-stream when trailers are configured on chunked responses
         // larger than a few KiB.)
         try {
-            s3.getObject(b -> b.bucket(bucket).key(key), (response, in) -> {
+            tenant.client().getObject(b -> b.bucket(bucket).key(s3K), (response, in) -> {
                 if (response.contentType() != null) ctx.contentType(response.contentType());
                 if (response.eTag() != null) ctx.header("ETag", response.eTag());
                 if (response.lastModified() != null) {
@@ -240,9 +260,11 @@ public class S3Routes {
     }
 
     private void handleHead(Context ctx) {
-        String key = ctx.pathParam("key");
-        HeadObjectResponse resp = s3.headObject(b -> b
-                .bucket(bucket).key(key));
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        String userKey = ctx.pathParam("key");
+        HeadObjectResponse resp = tenant.client().headObject(b -> b
+                .bucket(bucket).key(tenant.s3Key(userKey)));
         // AES-GCM (v4 default) appends a 16-byte authentication tag to the ciphertext.
         long len = Math.max(0, resp.contentLength() - GCM_TAG_BYTES);
         ctx.header("Content-Length", String.valueOf(len));
@@ -257,14 +279,18 @@ public class S3Routes {
     }
 
     private void deleteObject(Context ctx) {
-        s3.deleteObject(b -> b.bucket(bucket).key(ctx.pathParam("key")));
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        tenant.client().deleteObject(b -> b.bucket(bucket).key(tenant.s3Key(ctx.pathParam("key"))));
         ctx.status(HttpStatus.NO_CONTENT);
     }
 
     // --- Bucket-level operations ---------------------------------------------
 
     private void handleBucketHead(Context ctx) {
-        s3.headBucket(b -> b.bucket(bucket));
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        housekeepingClient.headBucket(b -> b.bucket(bucket));
         ctx.status(HttpStatus.OK);
     }
 
@@ -299,12 +325,19 @@ public class S3Routes {
     }
 
     private void deleteObjects(Context ctx) {
-        List<ObjectIdentifier> toDelete = parseDeleteRequestKeys(ctx.bodyAsBytes());
-        if (toDelete.isEmpty()) {
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        List<ObjectIdentifier> userKeys = parseDeleteRequestKeys(ctx.bodyAsBytes());
+        if (userKeys.isEmpty()) {
             writeS3Error(ctx, 400, "MalformedXML", "Delete request contained no keys.");
             return;
         }
-        DeleteObjectsResponse resp = s3.deleteObjects(DeleteObjectsRequest.builder()
+        // Apply tenant prefix to each requested key for the upstream call.
+        List<ObjectIdentifier> toDelete = new ArrayList<>(userKeys.size());
+        for (ObjectIdentifier u : userKeys) {
+            toDelete.add(ObjectIdentifier.builder().key(tenant.s3Key(u.key())).build());
+        }
+        DeleteObjectsResponse resp = tenant.client().deleteObjects(DeleteObjectsRequest.builder()
                 .bucket(bucket)
                 .delete(d -> d.objects(toDelete))
                 .build());
@@ -313,13 +346,13 @@ public class S3Routes {
         xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>");
         if (resp.deleted() != null) {
             for (DeletedObject d : resp.deleted()) {
-                xml.append("<Deleted><Key>").append(xmlEscape(d.key())).append("</Key></Deleted>");
+                xml.append("<Deleted><Key>").append(xmlEscape(tenant.stripPrefix(d.key()))).append("</Key></Deleted>");
             }
         }
         if (resp.errors() != null) {
             for (S3Error e : resp.errors()) {
                 xml.append("<Error>");
-                xml.append("<Key>").append(xmlEscape(e.key())).append("</Key>");
+                xml.append("<Key>").append(xmlEscape(tenant.stripPrefix(e.key()))).append("</Key>");
                 if (e.code() != null) xml.append("<Code>").append(xmlEscape(e.code())).append("</Code>");
                 if (e.message() != null) xml.append("<Message>").append(xmlEscape(e.message())).append("</Message>");
                 xml.append("</Error>");
@@ -350,8 +383,11 @@ public class S3Routes {
     }
 
     private void listMultipartUploads(Context ctx) {
-        ListMultipartUploadsResponse resp = s3.listMultipartUploads(
-                ListMultipartUploadsRequest.builder().bucket(bucket).build());
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        ListMultipartUploadsRequest.Builder req = ListMultipartUploadsRequest.builder().bucket(bucket);
+        if (tenant.tenantId() != null) req.prefix(tenant.prefix());
+        ListMultipartUploadsResponse resp = tenant.client().listMultipartUploads(req.build());
         String bucketParam = ctx.pathParam("bucket");
         StringBuilder xml = new StringBuilder(512);
         xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListMultipartUploadsResult>");
@@ -365,7 +401,7 @@ public class S3Routes {
         if (resp.uploads() != null) {
             for (MultipartUpload u : resp.uploads()) {
                 xml.append("<Upload>");
-                xml.append("<Key>").append(xmlEscape(u.key())).append("</Key>");
+                xml.append("<Key>").append(xmlEscape(tenant.stripPrefix(u.key()))).append("</Key>");
                 xml.append("<UploadId>").append(xmlEscape(u.uploadId())).append("</UploadId>");
                 if (u.initiated() != null) {
                     xml.append("<Initiated>").append(u.initiated().toString()).append("</Initiated>");
@@ -380,9 +416,11 @@ public class S3Routes {
     }
 
     private void listParts(Context ctx, String uploadId) {
-        String key = ctx.pathParam("key");
-        ListPartsResponse resp = s3.listParts(ListPartsRequest.builder()
-                .bucket(bucket).key(key).uploadId(uploadId).build());
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        String userKey = ctx.pathParam("key");
+        ListPartsResponse resp = tenant.client().listParts(ListPartsRequest.builder()
+                .bucket(bucket).key(tenant.s3Key(userKey)).uploadId(uploadId).build());
 
         // Snapshot our locally-buffered "pending" part, if any, so we can surface
         // it in the listing. Upstream doesn't see it yet — we hold the most-recent
@@ -390,7 +428,7 @@ public class S3Routes {
         Integer pendingNum = null;
         Integer pendingSize = null;
         String pendingEtag = null;
-        MultipartSession session = sessions.get(uploadId);
+        MultipartSession session = sessions.get(tenant.sessionKey(uploadId));
         if (session != null) {
             session.lock.lock();
             try {
@@ -408,7 +446,7 @@ public class S3Routes {
         StringBuilder xml = new StringBuilder(512);
         xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult>");
         xml.append("<Bucket>").append(xmlEscape(bucketParam)).append("</Bucket>");
-        xml.append("<Key>").append(xmlEscape(key)).append("</Key>");
+        xml.append("<Key>").append(xmlEscape(userKey)).append("</Key>");
         xml.append("<UploadId>").append(xmlEscape(uploadId)).append("</UploadId>");
         xml.append("<PartNumberMarker>0</PartNumberMarker>");
         int nextMarker = resp.nextPartNumberMarker() != null ? resp.nextPartNumberMarker() : 0;
@@ -453,10 +491,12 @@ public class S3Routes {
             if (s.createdAt.isBefore(cutoff)) expired.add(s);
         }
         for (MultipartSession s : expired) {
-            if (sessions.remove(s.uploadId) == null) continue;
+            if (sessions.remove(TenantCtx.sessionKeyFor(s.tenantId, s.uploadId)) == null) continue;
+            String s3K = TenantCtx.s3KeyFor(s.tenantId, s.key);
             try {
-                s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
-                        .bucket(bucket).key(s.key).uploadId(s.uploadId).build());
+                // Abort is not crypto-aware — housekeeping client works in either mode.
+                housekeepingClient.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                        .bucket(bucket).key(s3K).uploadId(s.uploadId).build());
             } catch (Exception e) {
                 System.err.println("multipart GC: abort failed for " + s.uploadId + ": " + e.getMessage());
             }
@@ -464,9 +504,13 @@ public class S3Routes {
     }
 
     private void listObjectsV2(Context ctx) {
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
         ListObjectsV2Request.Builder b = ListObjectsV2Request.builder().bucket(bucket);
-        String prefix = ctx.queryParam("prefix");
-        if (prefix != null) b.prefix(prefix);
+        String userPrefix = ctx.queryParam("prefix");
+        // In multitenant mode, force-scope the listing to <tenantId>/<userPrefix>.
+        String upstreamPrefix = tenant.prefix() + (userPrefix != null ? userPrefix : "");
+        if (!upstreamPrefix.isEmpty()) b.prefix(upstreamPrefix);
         String delimiter = ctx.queryParam("delimiter");
         if (delimiter != null) b.delimiter(delimiter);
         String maxKeys = ctx.queryParam("max-keys");
@@ -474,17 +518,17 @@ public class S3Routes {
         String continuationToken = ctx.queryParam("continuation-token");
         if (continuationToken != null) b.continuationToken(continuationToken);
         String startAfter = ctx.queryParam("start-after");
-        if (startAfter != null) b.startAfter(startAfter);
+        if (startAfter != null) b.startAfter(tenant.s3Key(startAfter));
 
-        ListObjectsV2Response resp = s3.listObjectsV2(b.build());
+        ListObjectsV2Response resp = tenant.client().listObjectsV2(b.build());
 
         String bucketParam = ctx.pathParam("bucket");
         StringBuilder xml = new StringBuilder(512);
         xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
         xml.append("<ListBucketResult>");
         xml.append("<Name>").append(xmlEscape(bucketParam)).append("</Name>");
-        if (prefix != null) {
-            xml.append("<Prefix>").append(xmlEscape(prefix)).append("</Prefix>");
+        if (userPrefix != null) {
+            xml.append("<Prefix>").append(xmlEscape(userPrefix)).append("</Prefix>");
         }
         if (delimiter != null) {
             xml.append("<Delimiter>").append(xmlEscape(delimiter)).append("</Delimiter>");
@@ -501,7 +545,7 @@ public class S3Routes {
         if (resp.contents() != null) {
             for (S3Object obj : resp.contents()) {
                 xml.append("<Contents>");
-                xml.append("<Key>").append(xmlEscape(obj.key())).append("</Key>");
+                xml.append("<Key>").append(xmlEscape(tenant.stripPrefix(obj.key()))).append("</Key>");
                 if (obj.lastModified() != null) {
                     xml.append("<LastModified>").append(obj.lastModified().toString()).append("</LastModified>");
                 }
@@ -518,7 +562,7 @@ public class S3Routes {
         if (resp.commonPrefixes() != null) {
             for (CommonPrefix cp : resp.commonPrefixes()) {
                 xml.append("<CommonPrefixes>");
-                xml.append("<Prefix>").append(xmlEscape(cp.prefix())).append("</Prefix>");
+                xml.append("<Prefix>").append(xmlEscape(tenant.stripPrefix(cp.prefix()))).append("</Prefix>");
                 xml.append("</CommonPrefixes>");
             }
         }
@@ -531,29 +575,35 @@ public class S3Routes {
     // --- Multipart operations ------------------------------------------------
 
     private void createMultipartUpload(Context ctx) {
-        String key = ctx.pathParam("key");
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        String userKey = ctx.pathParam("key");
         CreateMultipartUploadRequest.Builder b = CreateMultipartUploadRequest.builder()
-                .bucket(bucket).key(key);
+                .bucket(bucket).key(tenant.s3Key(userKey));
         String contentType = ctx.header("Content-Type");
         if (contentType != null) b.contentType(contentType);
         Map<String, String> userMeta = extractUserMetadata(ctx);
         if (!userMeta.isEmpty()) b.metadata(userMeta);
-        CreateMultipartUploadResponse resp = s3.createMultipartUpload(b.build());
+        CreateMultipartUploadResponse resp = tenant.client().createMultipartUpload(b.build());
         String uploadId = resp.uploadId();
-        sessions.put(uploadId, new MultipartSession(uploadId, key));
+        // Sessions store the user-facing key; we re-prefix at S3-op boundaries.
+        sessions.put(tenant.sessionKey(uploadId),
+                new MultipartSession(uploadId, userKey, tenant.tenantId()));
 
         String bucketParam = ctx.pathParam("bucket");
         ctx.contentType("application/xml");
         ctx.result("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
                 + "<InitiateMultipartUploadResult>"
                 + "<Bucket>" + xmlEscape(bucketParam) + "</Bucket>"
-                + "<Key>" + xmlEscape(key) + "</Key>"
+                + "<Key>" + xmlEscape(userKey) + "</Key>"
                 + "<UploadId>" + xmlEscape(uploadId) + "</UploadId>"
                 + "</InitiateMultipartUploadResult>");
     }
 
     private void uploadPart(Context ctx, String uploadId) {
-        MultipartSession session = sessions.get(uploadId);
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        MultipartSession session = sessions.get(tenant.sessionKey(uploadId));
         if (session == null) {
             writeS3Error(ctx, 404, "NoSuchUpload", "The specified upload does not exist.");
             return;
@@ -609,7 +659,7 @@ public class S3Routes {
                                     + "with CompleteMultipartUpload (treating it as the last part).");
                     return;
                 }
-                CompletedPart cp = flushPart(session, false);
+                CompletedPart cp = flushPart(tenant, session, false);
                 session.completedParts.add(cp);
             }
 
@@ -627,7 +677,9 @@ public class S3Routes {
     }
 
     private void completeMultipartUpload(Context ctx, String uploadId) {
-        MultipartSession session = sessions.get(uploadId);
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        MultipartSession session = sessions.get(tenant.sessionKey(uploadId));
         if (session == null) {
             writeS3Error(ctx, 404, "NoSuchUpload", "The specified upload does not exist.");
             return;
@@ -637,19 +689,19 @@ public class S3Routes {
         session.lock.lock();
         try {
             if (session.pendingPartBytes != null) {
-                CompletedPart cp = flushPart(session, true);
+                CompletedPart cp = flushPart(tenant, session, true);
                 session.completedParts.add(cp);
             }
 
             CompleteMultipartUploadRequest req = CompleteMultipartUploadRequest.builder()
-                    .bucket(bucket).key(session.key).uploadId(uploadId)
+                    .bucket(bucket).key(tenant.s3Key(session.key)).uploadId(uploadId)
                     .multipartUpload(b -> b.parts(session.completedParts))
                     .build();
-            resp = s3.completeMultipartUpload(req);
+            resp = tenant.client().completeMultipartUpload(req);
         } finally {
             session.lock.unlock();
         }
-        sessions.remove(uploadId);
+        sessions.remove(tenant.sessionKey(uploadId));
 
         String bucketParam = ctx.pathParam("bucket");
         ctx.contentType("application/xml");
@@ -663,31 +715,33 @@ public class S3Routes {
     }
 
     private void abortMultipartUpload(Context ctx, String uploadId) {
-        MultipartSession session = sessions.get(uploadId);
+        TenantCtx tenant = resolver.resolve(ctx);
+        if (tenant == null) return;
+        MultipartSession session = sessions.get(tenant.sessionKey(uploadId));
         if (session == null) {
             writeS3Error(ctx, 404, "NoSuchUpload", "The specified upload does not exist.");
             return;
         }
         session.lock.lock();
         try {
-            s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
-                    .bucket(bucket).key(session.key).uploadId(uploadId).build());
-            sessions.remove(uploadId);
+            tenant.client().abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                    .bucket(bucket).key(tenant.s3Key(session.key)).uploadId(uploadId).build());
+            sessions.remove(tenant.sessionKey(uploadId));
         } finally {
             session.lock.unlock();
         }
         ctx.status(HttpStatus.NO_CONTENT);
     }
 
-    private CompletedPart flushPart(MultipartSession session, boolean isLast) {
+    private CompletedPart flushPart(TenantCtx tenant, MultipartSession session, boolean isLast) {
         UploadPartRequest.Builder b = UploadPartRequest.builder()
-                .bucket(bucket).key(session.key)
+                .bucket(bucket).key(tenant.s3Key(session.key))
                 .uploadId(session.uploadId)
                 .partNumber(session.pendingPartNumber);
         if (isLast) {
             b.sdkPartType(SdkPartType.LAST);
         }
-        UploadPartResponse resp = s3.uploadPart(b.build(),
+        UploadPartResponse resp = tenant.client().uploadPart(b.build(),
                 RequestBody.fromBytes(session.pendingPartBytes));
         CompletedPart cp = CompletedPart.builder()
                 .partNumber(session.pendingPartNumber)
@@ -716,7 +770,8 @@ public class S3Routes {
         writeS3Error(ctx, status, code, message);
     }
 
-    private static void writeS3Error(Context ctx, int status, String code, String message) {
+    /** Package-private so resolver impls can use it for header-validation errors. */
+    static void writeS3Error(Context ctx, int status, String code, String message) {
         ctx.status(status);
         ctx.contentType("application/xml");
         ctx.result("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -748,6 +803,19 @@ public class S3Routes {
                 ctx.header("x-amz-meta-" + e.getKey(), e.getValue());
             }
         }
+    }
+
+    /**
+     * Walk the cause chain looking for the GCM auth-tag failure that AES-GCM
+     * surfaces as javax.crypto.AEADBadTagException (subclass of BadPaddingException).
+     * The S3 Encryption Client wraps this in its own exception.
+     */
+    private static boolean isAeadAuthFailure(Throwable t) {
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            if (cur instanceof BadPaddingException) return true;
+            if (cur == cur.getCause()) break;
+        }
+        return false;
     }
 
     private static String md5Hex(byte[] data) {

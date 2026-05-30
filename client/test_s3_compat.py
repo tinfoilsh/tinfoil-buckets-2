@@ -16,6 +16,21 @@ from botocore.exceptions import ClientError
 
 ENDPOINT = os.environ.get("ENDPOINT", "http://localhost:9000")
 BUCKET = os.environ.get("TEST_BUCKET", "anybucket")
+SIDECAR_MULTITENANT = os.environ.get("SIDECAR_MULTITENANT", "").lower() == "true"
+
+
+@pytest.fixture(autouse=True)
+def _require_single_tenant_mode():
+    """These tests don't send the multitenant headers, so every request would
+    400 against a multitenant server. Fail loudly if SIDECAR_MULTITENANT=true
+    so the misconfiguration is obvious instead of a wall of InvalidArgument."""
+    if SIDECAR_MULTITENANT:
+        pytest.fail(
+            "test_s3_compat.py is for single-tenant mode. SIDECAR_MULTITENANT=true is "
+            "set — use test_multitenant.py instead, or restart the sidecar without "
+            "MULTITENANT=true.",
+            pytrace=False,
+        )
 
 
 @pytest.fixture(scope="session")

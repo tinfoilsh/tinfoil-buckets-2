@@ -2,6 +2,14 @@ Tinfoil Buckets Sidecar.
 
 Simple server that exposes an S3 API to the local network. Internally uses S3 encrypted client. Encrypts & decrypts. Made to run as a side-car container on an enclave.
 
+> [!WARNING]
+> Differences from normal S3:
+>
+> - Sequential multipart only (`max_concurrency=1`)
+> - Non-last parts must be 16-byte aligned
+> - No ranged GETs
+> - GETs buffer the whole object (default 1 GiB; raise to 64 GiB or stream via `DANGEROUS_DELAYED_AUTH=true`)
+
 ## Usage
 
 1. Inside a tinfoil secure enclave. See our [persistent-storage-example](https://github.com/tinfoilsh/tinfoil-persistent-storage-example).
@@ -27,6 +35,30 @@ AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 PORT=9000
 ```
+
+### Multitenant mode
+
+For deployments where multiple tenants share one sidecar (each with their own
+encryption key), set `MULTITENANT=true`. In this mode:
+
+- `ENCRYPTION_KEY` is **not** required (and is ignored if set) — the key arrives per-request.
+- Every request must carry two headers:
+  - `X-Tinfoil-Tenant-Id: <id>` — must match `[A-Za-z0-9_-]{1,64}`.
+  - `X-Tinfoil-Encryption-Key: <base64 32-byte AES-256 key>` — encrypts/decrypts the object.
+- Objects are namespaced in the backing bucket under `<tenantId>/<key>`. The
+  prefix is invisible to callers — `ListObjectsV2` and `ListMultipartUploads`
+  return user-facing keys with the prefix stripped.
+- Multipart sessions are scoped to `(tenantId, uploadId)`; a different tenant
+  using the same `uploadId` gets `NoSuchUpload`.
+- Per-tenant encryption clients are cached (LRU, 256 entries) so cold-cache
+  requests pay a one-time build cost; subsequent requests reuse the cached client.
+- The sidecar trusts both headers — auth is the callers responsibility
+
+Tenant ID and encryption key are decoupled so a single tenant can rotate keys
+(or hold multiple keys for different objects) without changing namespace. The
+caller is responsible for tracking which key decrypts which object: if the
+wrong key arrives for a given object, the sidecar returns
+`400 DecryptionFailed`.
 
 ## Run
 
