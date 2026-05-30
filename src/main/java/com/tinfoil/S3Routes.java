@@ -172,19 +172,39 @@ public class S3Routes {
         TenantCtx tenant = resolver.resolve(ctx);
         if (tenant == null) return;
         String userKey = ctx.pathParam("key");
-        String lenHeader = ctx.header("Content-Length");
-        if (lenHeader == null) {
-            writeS3Error(ctx, 411, "MissingContentLength",
-                    "Content-Length header is required for PutObject.");
-            return;
-        }
+        // Streaming PUT uses X-Amz-Decoded-Content-Length not Content-Length
         long contentLength;
-        try {
-            contentLength = Long.parseLong(lenHeader);
-        } catch (NumberFormatException e) {
-            writeS3Error(ctx, 400, "InvalidArgument",
-                    "Content-Length must be a valid integer, got: " + lenHeader);
-            return;
+        java.io.InputStream body;
+        if (isAwsChunked(ctx)) {
+            String decoded = ctx.header("X-Amz-Decoded-Content-Length");
+            if (decoded == null) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "X-Amz-Decoded-Content-Length header is required for aws-chunked uploads.");
+                return;
+            }
+            try {
+                contentLength = Long.parseLong(decoded);
+            } catch (NumberFormatException e) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "X-Amz-Decoded-Content-Length must be a valid integer, got: " + decoded);
+                return;
+            }
+            body = new AwsChunkedInputStream(ctx.bodyInputStream());
+        } else {
+            String lenHeader = ctx.header("Content-Length");
+            if (lenHeader == null) {
+                writeS3Error(ctx, 411, "MissingContentLength",
+                        "Content-Length header is required for PutObject.");
+                return;
+            }
+            try {
+                contentLength = Long.parseLong(lenHeader);
+            } catch (NumberFormatException e) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "Content-Length must be a valid integer, got: " + lenHeader);
+                return;
+            }
+            body = ctx.bodyInputStream();
         }
 
         PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(tenant.s3Key(userKey));
@@ -194,9 +214,14 @@ public class S3Routes {
         if (!userMeta.isEmpty()) b.metadata(userMeta);
 
         PutObjectResponse resp = tenant.client().putObject(b.build(),
-                RequestBody.fromInputStream(ctx.bodyInputStream(), contentLength));
+                RequestBody.fromInputStream(body, contentLength));
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
         ctx.status(HttpStatus.OK);
+    }
+
+    private static boolean isAwsChunked(Context ctx) {
+        String enc = ctx.header("Content-Encoding");
+        return enc != null && enc.toLowerCase(java.util.Locale.ROOT).contains("aws-chunked");
     }
 
     private void handleGet(Context ctx) {
@@ -622,13 +647,44 @@ public class S3Routes {
                     "partNumber must be a valid integer, got: " + partNumberParam);
             return;
         }
-        long claimedLength = ctx.contentLength();
-        if (claimedLength > MAX_PART_BYTES) {
-            writeS3Error(ctx, 400, "EntityTooLarge",
-                    "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
-            return;
+        long claimedLength;
+        byte[] body;
+        // Streaming has a different content-length header
+        if (isAwsChunked(ctx)) {
+            String decoded = ctx.header("X-Amz-Decoded-Content-Length");
+            if (decoded == null) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "X-Amz-Decoded-Content-Length header is required for aws-chunked uploads.");
+                return;
+            }
+            try {
+                claimedLength = Long.parseLong(decoded);
+            } catch (NumberFormatException e) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "X-Amz-Decoded-Content-Length must be a valid integer, got: " + decoded);
+                return;
+            }
+            if (claimedLength > MAX_PART_BYTES) {
+                writeS3Error(ctx, 400, "EntityTooLarge",
+                        "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
+                return;
+            }
+            try (var dec = new AwsChunkedInputStream(ctx.bodyInputStream())) {
+                body = dec.readAllBytes();
+            } catch (java.io.IOException e) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "Malformed aws-chunked body: " + e.getMessage());
+                return;
+            }
+        } else {
+            claimedLength = ctx.contentLength();
+            if (claimedLength > MAX_PART_BYTES) {
+                writeS3Error(ctx, 400, "EntityTooLarge",
+                        "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
+                return;
+            }
+            body = ctx.bodyAsBytes();
         }
-        byte[] body = ctx.bodyAsBytes();
         if (body.length > MAX_PART_BYTES) {
             writeS3Error(ctx, 400, "EntityTooLarge",
                     "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
