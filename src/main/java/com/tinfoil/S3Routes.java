@@ -172,20 +172,10 @@ public class S3Routes {
         TenantCtx tenant = resolver.resolve(ctx);
         if (tenant == null) return;
         String userKey = ctx.pathParam("key");
-        String lenHeader = ctx.header("Content-Length");
-        if (lenHeader == null) {
-            writeS3Error(ctx, 411, "MissingContentLength",
-                    "Content-Length header is required for PutObject.");
-            return;
-        }
-        long contentLength;
-        try {
-            contentLength = Long.parseLong(lenHeader);
-        } catch (NumberFormatException e) {
-            writeS3Error(ctx, 400, "InvalidArgument",
-                    "Content-Length must be a valid integer, got: " + lenHeader);
-            return;
-        }
+
+        ResolvedBody rb = resolveBody(ctx, 411, "MissingContentLength",
+                "Content-Length header is required for PutObject.");
+        if (rb == null) return;
 
         PutObjectRequest.Builder b = PutObjectRequest.builder().bucket(bucket).key(tenant.s3Key(userKey));
         String contentType = ctx.header("Content-Type");
@@ -194,7 +184,7 @@ public class S3Routes {
         if (!userMeta.isEmpty()) b.metadata(userMeta);
 
         PutObjectResponse resp = tenant.client().putObject(b.build(),
-                RequestBody.fromInputStream(ctx.bodyInputStream(), contentLength));
+                RequestBody.fromInputStream(rb.stream(), rb.length()));
         if (resp.eTag() != null) ctx.header("ETag", resp.eTag());
         ctx.status(HttpStatus.OK);
     }
@@ -622,13 +612,22 @@ public class S3Routes {
                     "partNumber must be a valid integer, got: " + partNumberParam);
             return;
         }
-        long claimedLength = ctx.contentLength();
-        if (claimedLength > MAX_PART_BYTES) {
+        ResolvedBody rb = resolveBody(ctx, 400, "InvalidArgument",
+                "Content-Length header is required for UploadPart.");
+        if (rb == null) return;
+        if (rb.length() > MAX_PART_BYTES) {
             writeS3Error(ctx, 400, "EntityTooLarge",
                     "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
             return;
         }
-        byte[] body = ctx.bodyAsBytes();
+        byte[] body;
+        try (var stream = rb.stream()) {
+            body = stream.readAllBytes();
+        } catch (java.io.IOException e) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "Failed to read request body: " + e.getMessage());
+            return;
+        }
         if (body.length > MAX_PART_BYTES) {
             writeS3Error(ctx, 400, "EntityTooLarge",
                     "Part size exceeds MAX_PART_BYTES (" + MAX_PART_BYTES + ").");
@@ -781,6 +780,57 @@ public class S3Routes {
 
     private static String xmlEscape(String s) {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /** Inbound body paired with its declared plaintext length. {@code stream}
+     *  is either the raw request body or an {@link AwsChunkedInputStream}
+     *  wrapping it (for Content-Encoding: aws-chunked uploads). */
+    private record ResolvedBody(java.io.InputStream stream, long length) {}
+
+    /** Resolves the inbound body to (stream, plaintext-length), transparently
+     *  handling Content-Encoding: aws-chunked (the streaming PUT format every
+     *  modern AWS SDK uses by default). Writes a 4xx error to {@code ctx} and
+     *  returns {@code null} on validation failure — callers bail on null.
+     *
+     *  The {@code missingLengthStatus/Code/Message} parameters control the
+     *  error emitted on the non-chunked path when Content-Length is missing;
+     *  PutObject uses 411 / MissingContentLength to match S3, UploadPart uses
+     *  400 / InvalidArgument.
+     */
+    private ResolvedBody resolveBody(Context ctx, int missingLengthStatus,
+                                     String missingLengthCode, String missingLengthMessage) {
+        String enc = ctx.header("Content-Encoding");
+        if (enc != null && enc.toLowerCase(java.util.Locale.ROOT).contains("aws-chunked")) {
+            String decoded = ctx.header("X-Amz-Decoded-Content-Length");
+            if (decoded == null) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "X-Amz-Decoded-Content-Length header is required for aws-chunked uploads.");
+                return null;
+            }
+            long length;
+            try {
+                length = Long.parseLong(decoded);
+            } catch (NumberFormatException e) {
+                writeS3Error(ctx, 400, "InvalidArgument",
+                        "X-Amz-Decoded-Content-Length must be a valid integer, got: " + decoded);
+                return null;
+            }
+            return new ResolvedBody(new AwsChunkedInputStream(ctx.bodyInputStream()), length);
+        }
+        String lenHeader = ctx.header("Content-Length");
+        if (lenHeader == null) {
+            writeS3Error(ctx, missingLengthStatus, missingLengthCode, missingLengthMessage);
+            return null;
+        }
+        long length;
+        try {
+            length = Long.parseLong(lenHeader);
+        } catch (NumberFormatException e) {
+            writeS3Error(ctx, 400, "InvalidArgument",
+                    "Content-Length must be a valid integer, got: " + lenHeader);
+            return null;
+        }
+        return new ResolvedBody(ctx.bodyInputStream(), length);
     }
 
     private static Map<String, String> extractUserMetadata(Context ctx) {
